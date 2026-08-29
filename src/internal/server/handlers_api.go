@@ -102,6 +102,68 @@ func (a *App) handleSuggestions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, suggestions)
 }
 
+// handleNoticeStatus backs a session.Message's Notice field: a persisted
+// stand-in for a live event the UI might have missed always shows its
+// explanation text, but the actual action (a Download or Approve button)
+// needs to reflect the CURRENT state, not whatever was true when the
+// message was saved — the user may well have already fixed it since. This
+// re-derives the right suggestion/approval-status live, or reports
+// "resolved" so the frontend can just not show a button at all.
+func (a *App) handleNoticeStatus(w http.ResponseWriter, r *http.Request) {
+	notice := r.URL.Query().Get("notice")
+	installed := a.reg.Snapshot()
+
+	hasModel := func(kind registry.ModelKind, vision bool) bool {
+		for _, m := range installed {
+			if m.Kind != kind || m.IsVisionProjector {
+				continue
+			}
+			if vision && !m.VisionCapable() {
+				continue
+			}
+			return true
+		}
+		return false
+	}
+
+	switch notice {
+	case "no_text_model":
+		if hasModel(registry.KindText, false) {
+			writeJSON(w, map[string]any{"resolved": true})
+			return
+		}
+		writeJSON(w, map[string]any{"kind": "text", "suggestion": catalog.BestFit(a.cat, registry.KindText, a.profile, installed, false)})
+	case "no_vision_model":
+		if hasModel(registry.KindText, true) {
+			writeJSON(w, map[string]any{"resolved": true})
+			return
+		}
+		writeJSON(w, map[string]any{"kind": "text", "suggestion": catalog.BestFit(a.cat, registry.KindText, a.profile, installed, true)})
+	case "no_image_model":
+		if hasModel(registry.KindImage, false) {
+			writeJSON(w, map[string]any{"resolved": true})
+			return
+		}
+		writeJSON(w, map[string]any{"kind": "image", "suggestion": catalog.BestFit(a.cat, registry.KindImage, a.profile, installed, false)})
+	case "text_engine_approval":
+		t, _ := a.engines.Snapshot()
+		if t.Status == engine.StatusReady {
+			writeJSON(w, map[string]any{"resolved": true})
+			return
+		}
+		writeJSON(w, map[string]any{"component": "text", "engine_status": t})
+	case "image_engine_approval":
+		_, i := a.engines.Snapshot()
+		if i.Status == engine.StatusReady {
+			writeJSON(w, map[string]any{"resolved": true})
+			return
+		}
+		writeJSON(w, map[string]any{"component": "image", "engine_status": i})
+	default:
+		http.Error(w, "unknown notice", http.StatusBadRequest)
+	}
+}
+
 type bootstrapResponse struct {
 	HW               any                  `json:"hw"`
 	Models           []registry.Model     `json:"models"`

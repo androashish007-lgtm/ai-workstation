@@ -31,6 +31,13 @@ type Message struct {
 	Content    string    `json:"content"`
 	ImagePath  string    `json:"image_path,omitempty"`
 	ImagePaths []string  `json:"image_paths,omitempty"`
+	// Notice marks a persisted assistant message that stands in for a live
+	// event the UI might have missed (no matching model installed, an
+	// engine needs approval) — its value tells the frontend which live
+	// suggestion/approval card to (re-)fetch and show alongside this
+	// message, since the actual action (a Download or Approve button)
+	// needs current data, not whatever was true when this was saved.
+	Notice     string    `json:"notice,omitempty"`
 	Timestamp  time.Time `json:"timestamp"`
 }
 

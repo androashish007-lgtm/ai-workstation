@@ -378,9 +378,34 @@
       const urls = m.image_paths && m.image_paths.length
         ? m.image_paths.map(p => '/images/' + p)
         : (m.image_path ? ['/images/' + m.image_path] : []);
-      appendMessageEl(m.role, m.content, urls, m.timestamp);
+      const bubble = appendMessageEl(m.role, m.content, urls, m.timestamp);
+      if (m.role === 'assistant' && m.notice) attachNoticeCard(bubble, m.notice);
     }
     messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+
+  // A persisted notice's text is a snapshot of why a past turn failed —
+  // whether it still needs action (and what button to show for it) has to
+  // be checked live, since the user may well have already fixed it.
+  async function attachNoticeCard(bubble, notice) {
+    let status;
+    try { status = await api('/api/notice-status?notice=' + encodeURIComponent(notice)); } catch { return; }
+    if (!bubble.isConnected || status.resolved) return;
+    const NOTICE_LABELS = {
+      no_text_model: 'No chat model installed yet',
+      no_vision_model: 'No vision-capable chat model installed yet',
+      no_image_model: 'No image model installed yet',
+    };
+    let card;
+    if ('suggestion' in status) {
+      if (!status.suggestion) return; // nothing catalog-suggested fits this hardware
+      card = suggestionCard(status.suggestion, NOTICE_LABELS[notice] || 'No matching model installed yet');
+    } else if ('component' in status) {
+      card = approvalCard(status.component, status.engine_status);
+    } else {
+      return;
+    }
+    bubble.insertAdjacentElement('afterend', card);
   }
 
   function fmtTime(ts) {

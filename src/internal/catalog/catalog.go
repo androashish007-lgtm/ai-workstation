@@ -60,7 +60,7 @@ func Suggest(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed 
 			have[m.SHA256] = true
 		}
 	}
-	budget := profile.BudgetBytes()
+	budget := profile.InstallBudgetBytes()
 	var candidates []Entry
 	for _, e := range c.Entries {
 		if e.Kind != kind {

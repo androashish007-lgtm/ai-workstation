@@ -202,6 +202,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/hw", a.handleHW)
 	mux.HandleFunc("GET /api/registry", a.handleRegistry)
 	mux.HandleFunc("GET /api/suggestions", a.handleSuggestions)
+	mux.HandleFunc("GET /api/notice-status", a.handleNoticeStatus)
 	mux.HandleFunc("POST /api/downloads/model", a.handleDownloadModel)
 	mux.HandleFunc("GET /api/downloads/status", a.handleDownloadStatus)
 	mux.HandleFunc("GET /api/engine/status", a.handleEngineStatus)

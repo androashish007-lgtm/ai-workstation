@@ -72,6 +72,25 @@ func (p Profile) BudgetBytes() uint64 {
 	return avail - headroom
 }
 
+// InstallBudgetBytes is the looser hardware-fit check used when deciding
+// whether to even suggest a model for download (catalog.Suggest/BestFit),
+// as opposed to BudgetBytes' answer to "does this fit RIGHT NOW" for an
+// actual model-load decision. A download itself only needs disk space —
+// gating it on this moment's available RAM (which swings wildly with
+// whatever else happens to be running) means a model that's perfectly
+// fine for this hardware can stop being suggested at all just because
+// something else is briefly using memory. Based on total RAM instead.
+func (p Profile) InstallBudgetBytes() uint64 {
+	if p.VRAMBytes > 0 {
+		return p.VRAMBytes
+	}
+	headroom := p.TotalRAMBytes / 5 // keep ~20% of total as headroom
+	if headroom > p.TotalRAMBytes {
+		return 0
+	}
+	return p.TotalRAMBytes - headroom
+}
+
 func detectVulkan() bool {
 	if _, err := exec.LookPath("vulkaninfo"); err == nil {
 		return true

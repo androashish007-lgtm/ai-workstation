@@ -178,9 +178,17 @@ func (a *App) finishInterrupted(ctx context.Context, gen *Generation, sess *sess
 // all, forever, since nothing was ever saved. Re-opening this chat later
 // always re-renders from saved history first, so this is what guarantees
 // the explanation is seen even when the live event race is lost.
-func (a *App) persistNotice(sess *session.Session, text string) {
+//
+// notice, when non-empty, marks this as a stand-in for a specific live
+// event (see the session.Message.Notice doc) so the frontend knows to
+// fetch a *current* suggestion/approval card rather than trusting
+// whatever this text says — the situation may have already changed by
+// the time this message is actually viewed (e.g. the user already
+// installed the suggested model since). Pass "" for a plain error with
+// no follow-up action.
+func (a *App) persistNotice(sess *session.Session, text, notice string) {
 	sess.Messages = append(sess.Messages, session.Message{
-		Role: session.RoleAssistant, Content: text, Timestamp: time.Now(),
+		Role: session.RoleAssistant, Content: text, Notice: notice, Timestamp: time.Now(),
 	})
 	a.sessions.Save(sess)
 }
@@ -207,12 +215,22 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 		}
 		model, err := router.SelectTextModel(models, a.profile, complexity, needVision, tried)
 		if err != nil {
+			if len(tried) > 0 {
+				// A candidate WAS found and attempted (visible in tried) but
+				// generation failed on it — that's a load/OOM failure, not
+				// "nothing installed". Saying "not installed" here would send
+				// the user to re-download something they already have.
+				msg := "The installed model that fits this request failed to generate — likely not enough free memory to load it right now (other models or programs may be using it). Try again after closing something else, or resend in a moment."
+				gen.send(map[string]any{"type": "error", "message": msg})
+				a.persistNotice(sess, msg, "")
+				return "", false
+			}
 			suggestion := catalog.BestFit(a.cat, registry.KindText, a.profile, a.reg.Snapshot(), needVision)
 			gen.send(map[string]any{"type": "no_model", "kind": "text", "suggestion": suggestion})
 			if needVision {
-				a.persistNotice(sess, "No vision-capable chat model is installed, so I can't see the attached image. Approve the suggested download, then resend your message.")
+				a.persistNotice(sess, "No vision-capable chat model is installed, so I can't see the attached image. Approve the suggested download, then resend your message.", "no_vision_model")
 			} else {
-				a.persistNotice(sess, "No installed model fits this request yet. Approve the suggested download, then resend your message.")
+				a.persistNotice(sess, "No installed model fits this request yet. Approve the suggested download, then resend your message.", "no_text_model")
 			}
 			return "", false
 		}
@@ -221,7 +239,7 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 		if status != engine.StatusReady {
 			t, _ := a.engines.Snapshot()
 			gen.send(map[string]any{"type": "engine_approval_needed", "component": "text", "status": t})
-			a.persistNotice(sess, "Setting up the text engine for the first time — approve the download, then resend your message.")
+			a.persistNotice(sess, "Setting up the text engine for the first time — approve the download, then resend your message.", "text_engine_approval")
 			return "", false
 		}
 
@@ -241,7 +259,7 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 	}
 	const msg = "Text generation failed on every installed model that fits this hardware. Try a smaller model or a shorter request."
 	gen.send(map[string]any{"type": "error", "message": msg})
-	a.persistNotice(sess, msg)
+	a.persistNotice(sess, msg, "")
 	return "", false
 }
 
@@ -417,16 +435,25 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 		}
 		model, err := router.SelectImageModel(models, a.profile, tried)
 		if err != nil {
+			if len(tried) > 0 {
+				// A candidate WAS found and attempted (see runTextTurn's
+				// identical guard for why this needs to be distinguished
+				// from nothing-installed at all).
+				msg := "The installed model that fits this request failed to generate — likely not enough free memory to load it right now (other models or programs may be using it). Try again after closing something else, or resend in a moment."
+				gen.send(map[string]any{"type": "error", "message": msg})
+				a.persistNotice(sess, msg, "")
+				return nil, false
+			}
 			suggestion := catalog.BestFit(a.cat, registry.KindImage, a.profile, a.reg.Snapshot(), false)
 			gen.send(map[string]any{"type": "no_model", "kind": "image", "suggestion": suggestion})
-			a.persistNotice(sess, "No installed image model fits this request yet. Approve the suggested download, then resend your message.")
+			a.persistNotice(sess, "No installed image model fits this request yet. Approve the suggested download, then resend your message.", "no_image_model")
 			return nil, false
 		}
 		binPath, status := a.ensureImageBinary(ctx)
 		if status != engine.StatusReady {
 			_, i := a.engines.Snapshot()
 			gen.send(map[string]any{"type": "engine_approval_needed", "component": "image", "status": i})
-			a.persistNotice(sess, "Setting up the image engine for the first time — approve the download, then resend your message.")
+			a.persistNotice(sess, "Setting up the image engine for the first time — approve the download, then resend your message.", "image_engine_approval")
 			return nil, false
 		}
 
@@ -439,7 +466,7 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 			if saveErr != nil {
 				msg := "Image generated but could not be saved: " + saveErr.Error()
 				gen.send(map[string]any{"type": "error", "message": msg})
-				a.persistNotice(sess, msg)
+				a.persistNotice(sess, msg, "")
 				return nil, false
 			}
 			a.usageLog.Record(model.ID, displayModelName(*model), "image")
@@ -455,7 +482,7 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 	}
 	const msg = "Image generation didn't finish within the 10-minute budget on this hardware, across every installed model that fits."
 	gen.send(map[string]any{"type": "error", "message": msg})
-	a.persistNotice(sess, msg)
+	a.persistNotice(sess, msg, "")
 	return nil, false
 }
 
