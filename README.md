@@ -187,3 +187,14 @@ catalog changes, optional local-passphrase encryption of chat history,
 `update.sh`/`update.bat`/`update-termux.sh` maintenance scripts, an optional
 self-update check, and LLM-based (rather than keyword-based) text-vs-image
 intent detection.
+
+**Flux image model support**: the image engine invocation currently only
+passes a single checkpoint file (`-m <model>`), which is all SD1.5/SDXL
+single-file checkpoints need. Flux (dev/schnell) is a meaningfully higher
+quality option but needs 3 additional weight files loaded alongside the
+main diffusion model — a VAE, a CLIP-L text encoder, and a T5-XXL text
+encoder (itself several GB) — so this needs: extra CLI flags in
+`internal/engine/image.go`, a way for the registry to track/pair those
+companion files (similar to the existing vision-projector auto-pairing),
+and a catalog entry bundling all four files with a combined size that still
+fits a reasonable hardware budget.
