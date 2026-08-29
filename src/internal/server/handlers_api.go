@@ -98,7 +98,7 @@ func (a *App) handleSuggestions(w http.ResponseWriter, r *http.Request) {
 		kind = registry.KindImage
 	}
 	installed := a.reg.Snapshot()
-	suggestions := catalog.Suggest(a.cat, kind, a.profile, installed, 3)
+	suggestions := catalog.Suggest(a.cat, kind, a.profile, installed, 3, false)
 	writeJSON(w, suggestions)
 }
 
@@ -150,8 +150,8 @@ func (a *App) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, bootstrapResponse{
 		HW:               a.profile,
 		Models:           models,
-		SuggestionsText:  catalog.Suggest(a.cat, registry.KindText, a.profile, models, 3),
-		SuggestionsImage: catalog.Suggest(a.cat, registry.KindImage, a.profile, models, 3),
+		SuggestionsText:  catalog.Suggest(a.cat, registry.KindText, a.profile, models, 3, false),
+		SuggestionsImage: catalog.Suggest(a.cat, registry.KindImage, a.profile, models, 3, false),
 		TextEngine:       textState,
 		ImageEngine:      imageState,
 		Sessions:         a.withGeneratingFlag(sessions),

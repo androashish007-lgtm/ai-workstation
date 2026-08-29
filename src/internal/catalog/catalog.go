@@ -25,7 +25,8 @@ type Entry struct {
 	MinRAMBytes  uint64             `json:"min_ram_bytes"`
 	MinVRAMBytes uint64             `json:"min_vram_bytes,omitempty"`
 	Notes        string             `json:"notes,omitempty"`
-	Tier         int                `json:"tier"` // 1=smallest/fastest .. higher=larger/better quality
+	Tier         int                `json:"tier"`              // 1=smallest/fastest .. higher=larger/better quality
+	Vision       bool               `json:"vision,omitempty"` // true for a vision-capable chat model or its paired encoder
 }
 
 type Catalog struct {
@@ -47,8 +48,11 @@ func Load(path string) (*Catalog, error) {
 // Suggest returns catalog entries of the requested kind that (a) fit the
 // given hardware profile and (b) are not already installed (matched by
 // checksum against the registry), best tier first. limit caps how many
-// suggestions come back so the UI isn't flooded.
-func Suggest(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed []registry.Model, limit int) []Entry {
+// suggestions come back so the UI isn't flooded. When visionOnly is true,
+// only vision-capable entries (or their paired encoder) are considered —
+// use this when the request actually needs to look at an attached image,
+// so the suggestion is one that will actually fix the problem.
+func Suggest(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed []registry.Model, limit int, visionOnly bool) []Entry {
 	have := map[string]bool{}
 	for _, m := range installed {
 		if m.SHA256 != "" {
@@ -59,6 +63,9 @@ func Suggest(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed 
 	var candidates []Entry
 	for _, e := range c.Entries {
 		if e.Kind != kind {
+			continue
+		}
+		if visionOnly && !e.Vision {
 			continue
 		}
 		if e.SHA256 != "" && have[e.SHA256] {
@@ -72,7 +79,11 @@ func Suggest(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed 
 		}
 		candidates = append(candidates, e)
 	}
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Tier > candidates[j].Tier })
+	// Stable so that among same-tier entries (e.g. a vision model and its
+	// paired encoder), the one listed first in the catalog — conventionally
+	// the main model, whose notes explain the pairing — wins ties and is
+	// what BestFit's single pick surfaces.
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Tier > candidates[j].Tier })
 	if limit > 0 && len(candidates) > limit {
 		candidates = candidates[:limit]
 	}
@@ -80,8 +91,8 @@ func Suggest(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed 
 }
 
 // BestFit returns the single best entry the hardware can run, or nil.
-func BestFit(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed []registry.Model) *Entry {
-	s := Suggest(c, kind, profile, installed, 1)
+func BestFit(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed []registry.Model, visionOnly bool) *Entry {
+	s := Suggest(c, kind, profile, installed, 1, visionOnly)
 	if len(s) == 0 {
 		return nil
 	}

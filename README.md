@@ -49,7 +49,17 @@ filenames — keep the base model and its projector's names similar (e.g.
 
 If nothing installed fits a request (or the folders are empty), the chat UI
 suggests a model sized for your hardware with a one-click download —
-nothing is ever fetched without that click.
+nothing is ever fetched without that click. Sending a message with an
+attached image while no vision-capable model (see above) is installed
+works the same way: you get a clear explanation and a suggested vision
+model to download, saved to the chat so it's there even if you don't catch
+it live, rather than a reply that ignores the image.
+
+## Attaching images
+
+Click 📎 to attach one or more images to a message — each shows as its own
+thumbnail with an ✕ to remove it before sending. All of them go to the
+model together as part of that one message.
 
 ## How routing works (nothing to configure)
 
@@ -149,10 +159,17 @@ more often — that's the hardware, not a setting to tune.
 ## Phone/tablet access
 
 Click **📱 Phone access** in the sidebar for a QR code to the same UI over
-your local network — it always encodes this machine's actual LAN address,
-never `127.0.0.1` (which is meaningless to a phone). No cloud relay, no
-account, no telemetry — the only network calls this app ever makes are the
-engine/model downloads you approve.
+your local network — it always encodes this machine's actual LAN address
+(a real `192.168.x.x`/`10.x.x.x`-style private address, the same one
+`ipconfig`/`ifconfig` shows), never `127.0.0.1` (which is meaningless to a
+phone) and never a link-local `169.254.x.x` fallback address. No cloud
+relay, no account, no telemetry — the only network calls this app ever
+makes are the engine/model downloads you approve. If your phone still
+can't connect, see "Phone/tablet can't reach the LAN URL or QR code" in
+`TROUBLESHOOTING.md` — it's almost always a Windows Firewall prompt that
+was dismissed rather than allowed.
+
+The app listens on port **2222** by default (`--port <n>` to change it).
 
 ## Rebuilding the app binaries
 

@@ -42,7 +42,8 @@
       "size_bytes": 4683072416,
       "min_ram_bytes": 6979321856,
       "notes": "Vision-capable chat model. Install together with its vision-encoder entry — the registry auto-pairs them by filename so images work in chat.",
-      "tier": 2
+      "tier": 2,
+      "vision": true
     },
     {
       "id": "qwen2-vl-7b-instruct-vision-encoder",
@@ -53,7 +54,8 @@
       "size_bytes": 2703066624,
       "min_ram_bytes": 3221225472,
       "notes": "Pairs automatically with the Qwen2-VL 7B Instruct main model above.",
-      "tier": 2
+      "tier": 2,
+      "vision": true
     },
     {
       "id": "sd15-pruned-emaonly-q8",
@@ -65,6 +67,16 @@
       "min_ram_bytes": 3221225472,
       "notes": "Self-contained single-file checkpoint (no separate VAE/text-encoder needed) — default image model for most hardware.",
       "tier": 1
+    },
+    {
+      "id": "realvisxl-v5.0-fp16",
+      "name": "RealVisXL V5.0 (SDXL, fp16)",
+      "kind": "image",
+      "url": "https://huggingface.co/SG161222/RealVisXL_V5.0/resolve/main/RealVisXL_V5.0_fp16.safetensors?download=true",
+      "size_bytes": 6938065488,
+      "min_ram_bytes": 10737418240,
+      "notes": "SDXL photorealistic checkpoint, single-file (no separate VAE/text-encoder needed) — native 1024x1024, noticeably higher detail than the SD1.5 checkpoints. Auto-detected as SDXL from the filename, so it runs at 1024x1024 automatically. Meaningfully slower per step than SD1.5, but well within budget on a GPU.",
+      "tier": 2
     }
   ]
 }

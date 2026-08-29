@@ -26,7 +26,7 @@ import (
 
 func main() {
 	dir := flag.String("dir", ".", "path to the shared portable folder (models/, data/, engines/)")
-	port := flag.Int("port", 8420, "port to listen on (0 = pick any free port)")
+	port := flag.Int("port", 2222, "port to listen on (0 = pick any free port)")
 	noLAN := flag.Bool("no-lan", false, "bind to localhost only, don't expose on the local network")
 	noBrowser := flag.Bool("no-browser", false, "don't auto-open the default browser")
 	flag.Parse()

@@ -47,10 +47,24 @@ so, and a similar one-time wait.
 
 ## Port already in use
 
-By default the app tries port 8420 and lets the OS pick a free one if
+By default the app tries port 2222 and lets the OS pick a free one if
 that's unavailable — the terminal banner and browser always show the port
 actually in use. If you need a specific port, run the start script with
 `--port <n>` appended (e.g. `start.sh --port 9000`).
+
+## Phone/tablet can't reach the LAN URL or QR code
+
+Changing the port doesn't help if Windows Firewall is blocking the app
+outright — that's the far more common cause. The first time the app binds
+to the network, Windows should show a firewall prompt ("Windows Defender
+Firewall has blocked some features of this app") for **aistation-windows-\*.exe**;
+if you clicked "Cancel" instead of "Allow access", or it never appeared,
+LAN access will silently fail on every port. Fix it via **Windows Security
+→ Firewall & network protection → Allow an app through firewall** — find
+`aistation-windows-*.exe` (add it if it's not listed) and check both
+**Private** and **Public** (or whichever network this laptop is on). Also
+confirm the phone/tablet is on the same Wi-Fi network as the laptop, not
+mobile data — the LAN URL is only reachable from the same local network.
 
 ## Out of memory / model won't load
 

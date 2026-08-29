@@ -144,8 +144,11 @@ func (r *Registry) RescanAll() {
 			continue
 		}
 		for _, e := range entries {
-			if e.IsDir() || strings.HasSuffix(e.Name(), ".part") {
+			if e.IsDir() || strings.HasSuffix(e.Name(), ".part") || strings.HasPrefix(e.Name(), ".") {
 				continue
+			}
+			if info, err := e.Info(); err == nil && info.Size() == 0 {
+				continue // placeholder or still-empty download target, never a real model
 			}
 			path := filepath.Join(dir, e.Name())
 			abs, err := filepath.Abs(path)

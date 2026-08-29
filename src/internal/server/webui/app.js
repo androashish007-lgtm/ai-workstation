@@ -37,7 +37,7 @@
   // just this tab's live window into whichever session is currently shown;
   // switching sessions closes it and opens a new one for the newly-viewed
   // session, but never touches what's running server-side for any session.
-  let state = { sessions: [], projects: [], activeId: null, session: null, attachmentDataURI: null, generating: false };
+  let state = { sessions: [], projects: [], activeId: null, session: null, attachments: [], generating: false };
   let currentStream = null;
   let currentAssistantBubble = null;
   let editingProjectId = null; // null while the "New project" flow is open
@@ -325,6 +325,8 @@
     if (currentStream) { currentStream.close(); currentStream = null; }
     currentAssistantBubble = null;
     setComposerGenerating(false); // avoid a stale Stop label until this session's own stream reports in
+    state.attachments = [];
+    renderAttachPreview();
 
     state.session = await api('/api/sessions/' + id);
     state.activeId = id;
@@ -361,7 +363,10 @@
   function renderMessages() {
     messagesEl.innerHTML = '';
     for (const m of (state.session.messages || [])) {
-      appendMessageEl(m.role, m.content, m.image_path ? '/images/' + m.image_path : null, m.timestamp);
+      const urls = m.image_paths && m.image_paths.length
+        ? m.image_paths.map(p => '/images/' + p)
+        : (m.image_path ? ['/images/' + m.image_path] : []);
+      appendMessageEl(m.role, m.content, urls, m.timestamp);
     }
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
@@ -377,7 +382,7 @@
   // server yet, so the client's own clock at render time is used instead —
   // close enough for a timestamp label, and gets replaced with the real
   // saved value next time this session is loaded from disk.
-  function appendMessageEl(role, text, imageUrl, timestamp) {
+  function appendMessageEl(role, text, imageUrls, timestamp) {
     const wrap = document.createElement('div');
     wrap.className = 'msg ' + role;
     const col = document.createElement('div');
@@ -385,10 +390,10 @@
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
     if (text) bubble.appendChild(document.createTextNode(text));
-    if (imageUrl) {
+    for (const url of (imageUrls || [])) {
       const img = document.createElement('img');
       img.className = 'gen-image';
-      img.src = imageUrl;
+      img.src = url;
       bubble.appendChild(img);
     }
     col.appendChild(bubble);
@@ -475,24 +480,41 @@
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); composer.requestSubmit(); }
   });
 
-  attachInput.addEventListener('change', () => {
-    const file = attachInput.files[0];
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      state.attachmentDataURI = reader.result;
-      attachPreview.hidden = false;
-      attachPreview.innerHTML = '';
+  function renderAttachPreview() {
+    attachPreview.innerHTML = '';
+    attachPreview.hidden = state.attachments.length === 0;
+    state.attachments.forEach((dataURI, i) => {
+      const item = document.createElement('div');
+      item.className = 'attach-item';
       const img = document.createElement('img');
-      img.src = reader.result;
+      img.src = dataURI;
       const rm = document.createElement('button');
-      rm.textContent = 'Remove';
+      rm.textContent = '✕';
       rm.type = 'button';
-      rm.onclick = () => { state.attachmentDataURI = null; attachPreview.hidden = true; attachInput.value = ''; };
-      attachPreview.appendChild(img);
-      attachPreview.appendChild(rm);
-    };
-    reader.readAsDataURL(file);
+      rm.title = 'Remove';
+      rm.onclick = () => {
+        state.attachments.splice(i, 1);
+        renderAttachPreview();
+      };
+      item.appendChild(img);
+      item.appendChild(rm);
+      attachPreview.appendChild(item);
+    });
+  }
+
+  attachInput.addEventListener('change', () => {
+    const files = Array.from(attachInput.files || []);
+    if (!files.length) return;
+    Promise.all(files.map(file => new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    }))).then(dataURIs => {
+      state.attachments.push(...dataURIs);
+      renderAttachPreview();
+      attachInput.value = '';
+    });
   });
 
   newChatBtn.onclick = async () => {
@@ -646,17 +668,17 @@
 
     const sessionID = state.activeId;
     const body = { session_id: sessionID, message: text };
-    if (state.attachmentDataURI) body.attachment_data_uri = state.attachmentDataURI;
+    if (state.attachments.length) body.attachment_data_uris = state.attachments;
     input.value = '';
     autoGrow();
-    state.attachmentDataURI = null;
-    attachPreview.hidden = true;
+    state.attachments = [];
+    renderAttachPreview();
     attachInput.value = '';
 
     try {
       await api('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     } catch (err) {
-      appendMessageEl('assistant', 'Could not send: ' + err.message, null, new Date().toISOString());
+      appendMessageEl('assistant', 'Could not send: ' + err.message, [], new Date().toISOString());
       return;
     }
     // The response streams in via this session's live event feed — attach
@@ -673,7 +695,7 @@
 
   function ensureAssistantBubble() {
     if (!currentAssistantBubble) {
-      currentAssistantBubble = appendMessageEl('assistant', '', null, new Date().toISOString());
+      currentAssistantBubble = appendMessageEl('assistant', '', [], new Date().toISOString());
       currentAssistantBubble.classList.add('pending');
     }
     return currentAssistantBubble;
@@ -692,7 +714,8 @@
         const alreadyShown = last && last.classList.contains('user') &&
           last.querySelector('.bubble').textContent === evt.content;
         if (!alreadyShown) {
-          appendMessageEl('user', evt.content, evt.image_path ? '/images/' + evt.image_path : null, new Date().toISOString());
+          const urls = (evt.image_paths || []).map(p => '/images/' + p);
+          appendMessageEl('user', evt.content, urls, new Date().toISOString());
         }
         break;
       }

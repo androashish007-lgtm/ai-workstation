@@ -39,9 +39,9 @@ const imageTotalBudget = 10 * time.Minute
 const imageFirstAttemptTarget = 7 * time.Minute
 
 type chatRequestBody struct {
-	SessionID         string `json:"session_id"`
-	Message           string `json:"message"`
-	AttachmentDataURI string `json:"attachment_data_uri,omitempty"`
+	SessionID          string   `json:"session_id"`
+	Message            string   `json:"message"`
+	AttachmentDataURIs []string `json:"attachment_data_uris,omitempty"`
 }
 
 // handleChat only validates and kicks the actual work off in the
@@ -80,15 +80,18 @@ func (a *App) handleChat(w http.ResponseWriter, r *http.Request) {
 // of any HTTP connection. Every step reports itself through gen.send so
 // anyone watching (live or reconnected) sees the same thing.
 func (a *App) runChatTurn(ctx context.Context, gen *Generation, sess *session.Session, body chatRequestBody) {
-	hasAttachment := body.AttachmentDataURI != ""
+	hasAttachment := len(body.AttachmentDataURIs) > 0
 	userMsg := session.Message{Role: session.RoleUser, Content: body.Message, Timestamp: time.Now()}
 	if hasAttachment {
-		if p, err := a.saveDataURIImage(sess.ID, body.AttachmentDataURI); err == nil {
-			userMsg.ImagePath = p
+		for i, uri := range body.AttachmentDataURIs {
+			if p, err := a.saveDataURIImage(sess.ID, uri, i); err == nil {
+				userMsg.ImagePaths = append(userMsg.ImagePaths, p)
+			}
 		}
+		hasAttachment = len(userMsg.ImagePaths) > 0
 	}
 	sess.Messages = append(sess.Messages, userMsg)
-	gen.send(map[string]any{"type": "user_message", "content": body.Message, "image_path": userMsg.ImagePath})
+	gen.send(map[string]any{"type": "user_message", "content": body.Message, "image_paths": userMsg.ImagePaths})
 	// Saved immediately so the user's own message is never lost to history
 	// even if what follows is cancelled or interrupted.
 	sess.AutoTitle()
@@ -165,6 +168,23 @@ func (a *App) finishInterrupted(ctx context.Context, gen *Generation, sess *sess
 	gen.send(map[string]any{"type": "done"})
 }
 
+// persistNotice saves a short assistant-visible explanation to history for a
+// turn that ends without a real response (no installed model fits, an
+// engine needs approval, generation failed everywhere). Without this, a
+// turn that fails fast enough — no model installed is often near-instant,
+// there's no inference to wait on — can finish before the live SSE stream
+// even finishes connecting, so the event that explains why never reaches
+// the browser and the chat is left with the user's message and no reply at
+// all, forever, since nothing was ever saved. Re-opening this chat later
+// always re-renders from saved history first, so this is what guarantees
+// the explanation is seen even when the live event race is lost.
+func (a *App) persistNotice(sess *session.Session, text string) {
+	sess.Messages = append(sess.Messages, session.Message{
+		Role: session.RoleAssistant, Content: text, Timestamp: time.Now(),
+	})
+	a.sessions.Save(sess)
+}
+
 func displayModelName(m registry.Model) string {
 	if m.Name != "" {
 		return m.Name
@@ -187,8 +207,13 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 		}
 		model, err := router.SelectTextModel(models, a.profile, complexity, needVision, tried)
 		if err != nil {
-			suggestion := catalog.BestFit(a.cat, registry.KindText, a.profile, a.reg.Snapshot())
+			suggestion := catalog.BestFit(a.cat, registry.KindText, a.profile, a.reg.Snapshot(), needVision)
 			gen.send(map[string]any{"type": "no_model", "kind": "text", "suggestion": suggestion})
+			if needVision {
+				a.persistNotice(sess, "No vision-capable chat model is installed, so I can't see the attached image. Approve the suggested download, then resend your message.")
+			} else {
+				a.persistNotice(sess, "No installed model fits this request yet. Approve the suggested download, then resend your message.")
+			}
 			return "", false
 		}
 
@@ -196,6 +221,7 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 		if status != engine.StatusReady {
 			t, _ := a.engines.Snapshot()
 			gen.send(map[string]any{"type": "engine_approval_needed", "component": "text", "status": t})
+			a.persistNotice(sess, "Setting up the text engine for the first time — approve the download, then resend your message.")
 			return "", false
 		}
 
@@ -213,7 +239,9 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 	if ctx.Err() != nil {
 		return "", false // stopped by the user mid-retry — finishInterrupted handles reporting this
 	}
-	gen.send(map[string]any{"type": "error", "message": "Text generation failed on every installed model that fits this hardware. Try a smaller model or a shorter request."})
+	const msg = "Text generation failed on every installed model that fits this hardware. Try a smaller model or a shorter request."
+	gen.send(map[string]any{"type": "error", "message": msg})
+	a.persistNotice(sess, msg)
 	return "", false
 }
 
@@ -291,9 +319,11 @@ func (a *App) buildChatMessages(sess *session.Session, needVision bool) []engine
 	for i := start; i < len(sess.Messages); i++ {
 		m := sess.Messages[i]
 		cm := engine.ChatMessage{Role: string(m.Role), Content: m.Content}
-		if i == len(sess.Messages)-1 && needVision && m.ImagePath != "" {
-			if uri, err := a.imageFileToDataURI(m.ImagePath); err == nil {
-				cm.Images = []string{uri}
+		if i == len(sess.Messages)-1 && needVision && len(m.ImagePaths) > 0 {
+			for _, p := range m.ImagePaths {
+				if uri, err := a.imageFileToDataURI(p); err == nil {
+					cm.Images = append(cm.Images, uri)
+				}
 			}
 		}
 		msgs = append(msgs, cm)
@@ -387,14 +417,16 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 		}
 		model, err := router.SelectImageModel(models, a.profile, tried)
 		if err != nil {
-			suggestion := catalog.BestFit(a.cat, registry.KindImage, a.profile, a.reg.Snapshot())
+			suggestion := catalog.BestFit(a.cat, registry.KindImage, a.profile, a.reg.Snapshot(), false)
 			gen.send(map[string]any{"type": "no_model", "kind": "image", "suggestion": suggestion})
+			a.persistNotice(sess, "No installed image model fits this request yet. Approve the suggested download, then resend your message.")
 			return nil, false
 		}
 		binPath, status := a.ensureImageBinary(ctx)
 		if status != engine.StatusReady {
 			_, i := a.engines.Snapshot()
 			gen.send(map[string]any{"type": "engine_approval_needed", "component": "image", "status": i})
+			a.persistNotice(sess, "Setting up the image engine for the first time — approve the download, then resend your message.")
 			return nil, false
 		}
 
@@ -405,7 +437,9 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 		if err == nil {
 			relPath, url, saveErr := a.saveGeneratedImage(sess.ID, png)
 			if saveErr != nil {
-				gen.send(map[string]any{"type": "error", "message": "Image generated but could not be saved: " + saveErr.Error()})
+				msg := "Image generated but could not be saved: " + saveErr.Error()
+				gen.send(map[string]any{"type": "error", "message": msg})
+				a.persistNotice(sess, msg)
 				return nil, false
 			}
 			a.usageLog.Record(model.ID, displayModelName(*model), "image")
@@ -419,7 +453,9 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 	if ctx.Err() != nil {
 		return nil, false // stopped by the user mid-retry — finishInterrupted handles reporting this
 	}
-	gen.send(map[string]any{"type": "error", "message": "Image generation didn't finish within the 10-minute budget on this hardware, across every installed model that fits."})
+	const msg = "Image generation didn't finish within the 10-minute budget on this hardware, across every installed model that fits."
+	gen.send(map[string]any{"type": "error", "message": msg})
+	a.persistNotice(sess, msg)
 	return nil, false
 }
 
@@ -580,12 +616,12 @@ func (a *App) saveGeneratedImage(sessionID string, png []byte) (relPath, url str
 	return
 }
 
-func (a *App) saveDataURIImage(sessionID, dataURI string) (string, error) {
-	idx := strings.Index(dataURI, ",")
-	if idx == -1 {
+func (a *App) saveDataURIImage(sessionID, dataURI string, idx int) (string, error) {
+	commaIdx := strings.Index(dataURI, ",")
+	if commaIdx == -1 {
 		return "", fmt.Errorf("not a data URI")
 	}
-	raw, err := base64.StdEncoding.DecodeString(dataURI[idx+1:])
+	raw, err := base64.StdEncoding.DecodeString(dataURI[commaIdx+1:])
 	if err != nil {
 		return "", err
 	}
@@ -593,7 +629,7 @@ func (a *App) saveDataURIImage(sessionID, dataURI string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	filename := fmt.Sprintf("upload-%d.png", time.Now().UnixNano())
+	filename := fmt.Sprintf("upload-%d-%d.png", time.Now().UnixNano(), idx)
 	if err := os.WriteFile(filepath.Join(dir, filename), raw, 0o644); err != nil {
 		return "", err
 	}

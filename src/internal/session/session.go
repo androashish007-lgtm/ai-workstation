@@ -23,12 +23,15 @@ const (
 )
 
 // Message is one turn. ImagePath is set (and Content may be empty or hold
-// the caption/prompt) when this turn produced or attached an image.
+// the caption/prompt) when this turn produced a generated image.
+// ImagePaths holds one or more images the user attached to their own
+// message (as input for the assistant to look at, not something it made).
 type Message struct {
-	Role      Role      `json:"role"`
-	Content   string    `json:"content"`
-	ImagePath string    `json:"image_path,omitempty"`
-	Timestamp time.Time `json:"timestamp"`
+	Role       Role      `json:"role"`
+	Content    string    `json:"content"`
+	ImagePath  string    `json:"image_path,omitempty"`
+	ImagePaths []string  `json:"image_paths,omitempty"`
+	Timestamp  time.Time `json:"timestamp"`
 }
 
 type Session struct {
