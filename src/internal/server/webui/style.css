@@ -140,6 +140,31 @@ body {
 .session-item .icon-btn { opacity: 0; }
 .session-item:hover .icon-btn { opacity: 1; }
 
+.move-menu {
+  position: fixed;
+  z-index: 60;
+  min-width: 160px;
+  max-width: 220px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0,0,0,.25);
+  padding: 4px;
+  font-size: 13px;
+}
+.move-menu-item {
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.move-menu-item:hover { background: var(--border); }
+.move-menu-item.current { color: var(--accent); font-weight: 600; }
+.move-menu-item.current::before { content: "✓ "; }
+
 .sidebar-footer { border-top: 1px solid var(--border); padding-top: 10px; font-size: 12px; }
 .sidebar-footer button {
   width: 100%;

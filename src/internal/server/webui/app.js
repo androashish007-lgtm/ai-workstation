@@ -146,6 +146,46 @@
     }
   }
 
+  let openMoveMenu = null;
+  function closeMoveMenu() {
+    if (openMoveMenu) { openMoveMenu.remove(); openMoveMenu = null; }
+  }
+  document.addEventListener('click', closeMoveMenu);
+
+  function toggleMoveMenu(anchorBtn, s) {
+    const wasOpen = !!openMoveMenu;
+    closeMoveMenu();
+    if (wasOpen) return; // clicking the same button again just closes it
+
+    const menu = document.createElement('div');
+    menu.className = 'move-menu';
+    const addItem = (label, projectId) => {
+      const item = document.createElement('div');
+      item.className = 'move-menu-item' + ((s.project_id || '') === projectId ? ' current' : '');
+      item.textContent = label;
+      item.onclick = async (e) => {
+        e.stopPropagation();
+        closeMoveMenu();
+        try {
+          await api('/api/sessions/' + s.id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id: projectId }) });
+        } catch (err) {
+          alert('Could not move chat: ' + err.message);
+        }
+        await refreshSessionList();
+      };
+      menu.appendChild(item);
+    };
+    addItem('No project', '');
+    for (const p of state.projects) addItem(p.name, p.id);
+
+    document.body.appendChild(menu);
+    const rect = anchorBtn.getBoundingClientRect();
+    const menuWidth = 180;
+    menu.style.top = (rect.bottom + 4) + 'px';
+    menu.style.left = Math.min(rect.left, window.innerWidth - menuWidth - 8) + 'px';
+    openMoveMenu = menu;
+  }
+
   function sessionItemEl(s) {
     const el = document.createElement('div');
     el.className = 'session-item' + (s.id === state.activeId ? ' active' : '');
@@ -158,6 +198,14 @@
       dot.className = 'session-generating-dot';
       dot.title = 'Still working on a response';
       el.appendChild(dot);
+    }
+    if (state.projects.length) {
+      const moveBtn = document.createElement('button');
+      moveBtn.className = 'icon-btn';
+      moveBtn.textContent = '📁';
+      moveBtn.title = 'Move to project';
+      moveBtn.onclick = (e) => { e.stopPropagation(); toggleMoveMenu(moveBtn, s); };
+      el.appendChild(moveBtn);
     }
     const delBtn = document.createElement('button');
     delBtn.className = 'icon-btn';

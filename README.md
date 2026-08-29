@@ -95,6 +95,9 @@ shared notes are common. Editing a project's notes (✎) affects every chat
 in it going forward; deleting a project ungroups its chats rather than
 deleting them.
 
+Existing chats can be moved in or out of a project any time — hover a chat
+for the **📁** icon and pick a project (or "No project" to ungroup).
+
 ## Model usage
 
 The **Model usage** tab (sidebar, next to Chat) shows which installed
