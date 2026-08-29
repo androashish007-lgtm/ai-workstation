@@ -340,10 +340,22 @@
   function attachStream(id) {
     const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/stream');
     currentStream = es;
-    es.onmessage = (e) => {
+    es.onmessage = async (e) => {
       if (state.activeId !== id) return; // user switched away since this connected; ignore stale updates
       let evt;
       try { evt = JSON.parse(e.data); } catch { return; }
+      if (evt.type === 'idle') {
+        // Nothing was replayed, which means either nothing is running for
+        // this chat, or — the case that matters here — a turn that fails
+        // fast (e.g. no matching model installed, no real inference to
+        // wait on) finished and was cleaned up before this connection even
+        // reached the server. Either way, re-fetching picks up whatever
+        // was actually saved instead of silently showing a stale view.
+        try {
+          const fresh = await api('/api/sessions/' + encodeURIComponent(id));
+          if (state.activeId === id) { state.session = fresh; renderMessages(); }
+        } catch {}
+      }
       setComposerGenerating(!TERMINAL_EVENTS.has(evt.type));
       handleEvent(evt);
       if (TERMINAL_EVENTS.has(evt.type)) {
@@ -707,13 +719,23 @@
     if (!text) return;
 
     const sessionID = state.activeId;
+    const attachments = state.attachments;
     const body = { session_id: sessionID, message: text };
-    if (state.attachments.length) body.attachment_data_uris = state.attachments;
+    if (attachments.length) body.attachment_data_uris = attachments;
     input.value = '';
     autoGrow();
     state.attachments = [];
     renderAttachPreview();
     attachInput.value = '';
+
+    // Render the sent message immediately rather than waiting on the live
+    // SSE echo — a turn that fails fast (e.g. no matching model installed,
+    // which needs no actual inference) can finish before the stream even
+    // connects, and without this the message looks like it just vanished.
+    // The user_message SSE handler's "already shown" check keys off this
+    // same text, so the live event won't double-render it when it does
+    // arrive in time.
+    appendMessageEl('user', text, attachments, new Date().toISOString());
 
     try {
       await api('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -746,10 +768,10 @@
       case 'idle':
         break;
       case 'user_message': {
-        // Only the sender's own tab already shows this optimistically via
-        // a fresh page render — but openSession() always re-renders from
-        // saved history first, so a live user_message here means it's not
-        // saved yet: append it once.
+        // The sender's own tab already rendered this optimistically on
+        // submit (see the composer submit handler) — a live event here is
+        // either that same message catching up, or this chat being viewed
+        // from a different tab/device that never rendered it locally.
         const last = messagesEl.lastElementChild;
         const alreadyShown = last && last.classList.contains('user') &&
           last.querySelector('.bubble').textContent === evt.content;
