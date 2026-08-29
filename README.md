@@ -120,9 +120,15 @@ for the **📁** icon and pick a project (or "No project" to ungroup).
 
 ## Model usage
 
-The **Model usage** tab (sidebar, next to Chat) shows which installed
-models actually get used, most to least, based on real requests — not
-guesswork. Nothing here is configurable; it's purely informational.
+The **Model usage** tab (sidebar, next to Chat) lists every model actually
+installed on disk — not just ones that happen to have been used yet —
+grouped by `models/text/` and `models/image/`. Each one shows its file
+size, a one-line description of what it's actually good for (vision-capable
+chat, fast vs. high-quality chat, SD1.5 vs. SDXL image generation, editing
+checkpoints that need a reference image, etc.), and how many times it's
+really been used. A 🗑 next to each one deletes that file from disk (with a
+confirmation) — useful for clearing out a model that turned out not to be
+worth the space.
 
 ## GPU detection
 

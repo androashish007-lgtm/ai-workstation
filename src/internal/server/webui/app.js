@@ -537,28 +537,68 @@
 
   async function loadModelUsage() {
     usageTable.innerHTML = '<div class="usage-empty">Loading…</div>';
-    let records;
-    try { records = await api('/api/usage/models'); } catch (e) { records = []; }
-    if (!records || !records.length) {
-      usageTable.innerHTML = '<div class="usage-empty">No models used yet — usage is logged the first time a chat or image request completes.</div>';
+    let groups;
+    try { groups = await api('/api/usage/models'); } catch (e) { groups = { text: [], image: [] }; }
+    const text = groups.text || [], image = groups.image || [];
+    if (!text.length && !image.length) {
+      usageTable.innerHTML = '<div class="usage-empty">No models installed — drop a .gguf into models/text/ or a .gguf/.safetensors into models/image/.</div>';
       return;
     }
-    const maxCount = Math.max(...records.map(r => r.count));
     usageTable.innerHTML = '';
-    records.forEach((r, i) => {
+    usageTable.appendChild(renderModelGroup('models/text/', text));
+    usageTable.appendChild(renderModelGroup('models/image/', image));
+  }
+
+  function renderModelGroup(folderLabel, entries) {
+    const section = document.createElement('div');
+    section.className = 'usage-group';
+    const heading = document.createElement('h3');
+    heading.className = 'usage-group-heading';
+    heading.textContent = folderLabel + ' (' + entries.length + ')';
+    section.appendChild(heading);
+    if (!entries.length) {
+      const empty = document.createElement('div');
+      empty.className = 'usage-empty';
+      empty.textContent = 'Nothing installed here yet.';
+      section.appendChild(empty);
+      return section;
+    }
+    const maxCount = Math.max(1, ...entries.map(r => r.count));
+    entries.forEach(r => {
       const row = document.createElement('div');
       row.className = 'usage-row';
-      const pct = maxCount ? Math.max(4, Math.round(100 * r.count / maxCount)) : 0;
-      const last = r.last_used_at ? new Date(r.last_used_at).toLocaleString() : '';
+      const pct = r.count ? Math.max(4, Math.round(100 * r.count / maxCount)) : 0;
+      const last = r.last_used_at ? new Date(r.last_used_at).toLocaleString() : 'never';
       row.innerHTML = `
-        <div class="rank">#${i + 1}</div>
-        <div class="name">${escapeHtml(r.name)}<span class="kind">${r.kind}</span></div>
-        <div class="bar-wrap"><div class="bar-fill" style="width:${pct}%"></div></div>
-        <div class="count">${r.count} use${r.count === 1 ? '' : 's'}</div>
+        <div class="usage-row-main">
+          <div class="name">${escapeHtml(r.name)}<span class="size">${fmtBytes(r.size_bytes)}</span></div>
+          <div class="use-case">${escapeHtml(r.use_case)}</div>
+          <div class="usage-stats">
+            <div class="bar-wrap"><div class="bar-fill" style="width:${pct}%"></div></div>
+            <div class="count">${r.count} use${r.count === 1 ? '' : 's'} · last ${last}</div>
+          </div>
+        </div>
+        <button class="model-delete-btn" title="Delete this model file">🗑</button>
       `;
-      row.title = last ? `Last used ${last}` : '';
-      usageTable.appendChild(row);
+      row.querySelector('.model-delete-btn').onclick = () => deleteModel(r, row);
+      section.appendChild(row);
     });
+    return section;
+  }
+
+  async function deleteModel(entry, row) {
+    if (!confirm(`Delete "${entry.name}" (${entry.filename}, ${fmtBytes(entry.size_bytes)}) from disk? This can't be undone.`)) return;
+    const btn = row.querySelector('.model-delete-btn');
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+      await api('/api/models/' + encodeURIComponent(entry.id), { method: 'DELETE' });
+      row.remove();
+    } catch (e) {
+      alert('Could not delete: ' + e.message);
+      btn.disabled = false;
+      btn.textContent = '🗑';
+    }
   }
 
   function escapeHtml(s) {

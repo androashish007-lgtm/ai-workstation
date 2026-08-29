@@ -41,9 +41,10 @@
       "sha256": "5e9d63f2419285a0d76c5da15f12a1e2f9f0f79096458a541d8c7f47efe5bc2e",
       "size_bytes": 4683072416,
       "min_ram_bytes": 6979321856,
-      "notes": "Vision-capable chat model. Install together with its vision-encoder entry — the registry auto-pairs them by filename so images work in chat.",
+      "notes": "Vision-capable chat model. Downloading this also fetches its required vision-encoder file automatically — the registry then auto-pairs them by filename so images work in chat.",
       "tier": 2,
-      "vision": true
+      "vision": true,
+      "pair_with": "qwen2-vl-7b-instruct-vision-encoder"
     },
     {
       "id": "qwen2-vl-7b-instruct-vision-encoder",
@@ -53,9 +54,10 @@
       "sha256": "e315ed7aea5d835dd1dbee376b4f89478c240f56957901081d27e636a029e88b",
       "size_bytes": 2703066624,
       "min_ram_bytes": 3221225472,
-      "notes": "Pairs automatically with the Qwen2-VL 7B Instruct main model above.",
+      "notes": "Required alongside the Qwen2-VL 7B Instruct main model — useless installed alone. Downloading either one fetches both automatically.",
       "tier": 2,
-      "vision": true
+      "vision": true,
+      "pair_with": "qwen2-vl-7b-instruct-q4km"
     },
     {
       "id": "sd15-pruned-emaonly-q8",

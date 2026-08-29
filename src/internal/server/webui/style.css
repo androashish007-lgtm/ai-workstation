@@ -400,17 +400,32 @@ body {
 .usage-table { padding: 8px 12% 24px; overflow-y: auto; flex: 1; }
 @media (max-width: 900px) { .usage-table { padding: 8px 16px 24px; } }
 
+.usage-group { margin-bottom: 8px; }
+.usage-group-heading {
+  margin: 20px 0 4px; padding-top: 12px; border-top: 1px solid var(--border);
+  font-size: 13px; font-weight: 600; color: var(--text-dim); text-transform: none;
+}
+.usage-group:first-child .usage-group-heading { border-top: none; padding-top: 0; margin-top: 4px; }
+
 .usage-row {
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 10px 4px;
+  padding: 12px 4px;
   border-bottom: 1px solid var(--border);
 }
-.usage-row .rank { color: var(--text-dim); font-size: 12px; width: 20px; flex-shrink: 0; }
-.usage-row .name { flex: 1; min-width: 0; }
-.usage-row .name .kind { color: var(--text-dim); font-size: 11px; margin-left: 6px; }
-.usage-row .bar-wrap { flex: 2; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; }
+.usage-row-main { flex: 1; min-width: 0; }
+.usage-row .name { font-weight: 500; }
+.usage-row .name .size { color: var(--text-dim); font-size: 11px; margin-left: 8px; font-weight: 400; }
+.usage-row .use-case { color: var(--text-dim); font-size: 12.5px; margin-top: 2px; }
+.usage-stats { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.usage-row .bar-wrap { width: 120px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; flex-shrink: 0; }
 .usage-row .bar-fill { height: 100%; background: var(--accent); }
-.usage-row .count { width: 90px; text-align: right; color: var(--text-dim); font-size: 12.5px; flex-shrink: 0; }
+.usage-row .count { color: var(--text-dim); font-size: 12px; flex-shrink: 0; }
+.model-delete-btn {
+  flex-shrink: 0; border: none; background: none; color: var(--danger);
+  cursor: pointer; font-size: 15px; padding: 6px 8px; border-radius: var(--radius);
+}
+.model-delete-btn:hover { background: var(--border); }
+.model-delete-btn:disabled { opacity: .5; cursor: default; }
 .usage-empty { color: var(--text-dim); padding: 12px 4px; font-size: 13.5px; }

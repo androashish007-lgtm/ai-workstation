@@ -223,43 +223,100 @@ func (a *App) handleDownloadModel(w http.ResponseWriter, r *http.Request) {
 	a.dlProgress = DownloadStatus{Active: true, EntryID: entry.ID, Name: entry.Name, TotalBytes: entry.SizeBytes}
 	a.dlMu.Unlock()
 
-	destDir := a.dirs.ModelsText
-	if entry.Kind == registry.KindImage {
-		destDir = a.dirs.ModelsImage
+	// A companion file (e.g. a vision model's required encoder) is
+	// downloaded right after, in the same background task — otherwise a
+	// suggestion card that only offers one of the two ends up installing a
+	// model that's useless alone, with nothing telling the user a second
+	// file was ever needed.
+	var pair *catalog.Entry
+	if entry.PairWith != "" && !a.modelInstalled(entry.PairWith) {
+		for i := range a.cat.Entries {
+			if a.cat.Entries[i].ID == entry.PairWith {
+				pair = &a.cat.Entries[i]
+				break
+			}
+		}
 	}
-	filename := filenameFromURL(entry.URL)
-	dest := filepath.Join(destDir, filename)
 
 	safego.Go(func() {
 		opID, end := a.activity.Begin(ActivityDownloadingModel)
 		defer end()
-		_, err := download.Fetch(download.Options{
-			URL:            entry.URL,
-			Dest:           dest,
-			ExpectedSHA256: entry.SHA256,
-			OnProgress: func(p download.Progress) {
+		if err := a.fetchCatalogEntry(opID, *entry); err != nil {
+			a.dlMu.Lock()
+			a.dlProgress.Active = false
+			a.dlProgress.Done = true
+			a.dlProgress.Error = err.Error()
+			a.dlMu.Unlock()
+			return
+		}
+		if pair != nil {
+			a.dlMu.Lock()
+			a.dlProgress = DownloadStatus{Active: true, EntryID: pair.ID, Name: pair.Name, TotalBytes: pair.SizeBytes}
+			a.dlMu.Unlock()
+			if err := a.fetchCatalogEntry(opID, *pair); err != nil {
 				a.dlMu.Lock()
-				a.dlProgress.DoneBytes = p.DoneBytes
-				if p.TotalBytes > 0 {
-					a.dlProgress.TotalBytes = p.TotalBytes
-				}
+				a.dlProgress.Active = false
+				a.dlProgress.Done = true
+				a.dlProgress.Error = "companion file failed: " + err.Error()
 				a.dlMu.Unlock()
-				a.activity.Beat(opID)
-			},
-		})
+				a.reg.RescanAll()
+				return
+			}
+		}
 		a.dlMu.Lock()
 		a.dlProgress.Active = false
 		a.dlProgress.Done = true
-		if err != nil {
-			a.dlProgress.Error = err.Error()
-		}
 		a.dlMu.Unlock()
-		if err == nil {
-			a.reg.RescanAll()
-		}
+		a.reg.RescanAll()
 	})
 
 	w.WriteHeader(http.StatusAccepted)
+}
+
+// modelInstalled reports whether the catalog entry with the given id is
+// already present in the registry (matched by checksum).
+func (a *App) modelInstalled(catalogID string) bool {
+	var target *catalog.Entry
+	for i := range a.cat.Entries {
+		if a.cat.Entries[i].ID == catalogID {
+			target = &a.cat.Entries[i]
+			break
+		}
+	}
+	if target == nil || target.SHA256 == "" {
+		return false
+	}
+	for _, m := range a.reg.Snapshot() {
+		if m.SHA256 == target.SHA256 {
+			return true
+		}
+	}
+	return false
+}
+
+// fetchCatalogEntry downloads one catalog entry to its destination folder,
+// reporting progress on the shared a.dlProgress used by the polling UI.
+func (a *App) fetchCatalogEntry(opID string, entry catalog.Entry) error {
+	destDir := a.dirs.ModelsText
+	if entry.Kind == registry.KindImage {
+		destDir = a.dirs.ModelsImage
+	}
+	dest := filepath.Join(destDir, filenameFromURL(entry.URL))
+	_, err := download.Fetch(download.Options{
+		URL:            entry.URL,
+		Dest:           dest,
+		ExpectedSHA256: entry.SHA256,
+		OnProgress: func(p download.Progress) {
+			a.dlMu.Lock()
+			a.dlProgress.DoneBytes = p.DoneBytes
+			if p.TotalBytes > 0 {
+				a.dlProgress.TotalBytes = p.TotalBytes
+			}
+			a.dlMu.Unlock()
+			a.activity.Beat(opID)
+		},
+	})
+	return err
 }
 
 func filenameFromURL(u string) string {
@@ -487,8 +544,3 @@ func (a *App) handleLANURL(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"url": url})
 }
 
-// handleModelUsage backs the "Model usage" tab: which installed models are
-// actually used, most to least, sourced from the on-disk usage log.
-func (a *App) handleModelUsage(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, a.usageLog.Snapshot())
-}

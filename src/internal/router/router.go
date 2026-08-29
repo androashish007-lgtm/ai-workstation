@@ -132,7 +132,7 @@ func SelectTextModel(models []registry.Model, profile hw.Profile, complexity Com
 // when nothing else installed fits the request.
 var editingModelHints = []string{"pix2pix", "inpaint", "controlnet", "img2img"}
 
-func looksLikeEditingModel(filename string) bool {
+func LooksLikeEditingModel(filename string) bool {
 	f := strings.ToLower(filename)
 	for _, hint := range editingModelHints {
 		if strings.Contains(f, hint) {
@@ -145,7 +145,7 @@ func looksLikeEditingModel(filename string) bool {
 // SelectImageModel picks the largest installed plain text-to-image model
 // that fits the hardware budget (conditioned editing checkpoints like
 // pix2pix/inpainting are deprioritized to a last resort — see
-// looksLikeEditingModel), since Phase 1 doesn't yet infer style/quality
+// LooksLikeEditingModel), since Phase 1 doesn't yet infer style/quality
 // tiers beyond "best the hardware can run."
 func SelectImageModel(models []registry.Model, profile hw.Profile, exclude map[string]bool) (*registry.Model, error) {
 	var candidates, editingCandidates []registry.Model
@@ -153,7 +153,7 @@ func SelectImageModel(models []registry.Model, profile hw.Profile, exclude map[s
 		if m.Kind != registry.KindImage || (exclude != nil && exclude[m.ID]) {
 			continue
 		}
-		if looksLikeEditingModel(m.Filename) {
+		if LooksLikeEditingModel(m.Filename) {
 			editingCandidates = append(editingCandidates, m)
 		} else {
 			candidates = append(candidates, m)

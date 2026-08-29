@@ -223,5 +223,6 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/lan-url", a.handleLANURL)
 	mux.HandleFunc("GET /api/system/usage", a.handleSystemUsage)
 	mux.HandleFunc("GET /api/usage/models", a.handleModelUsage)
+	mux.HandleFunc("DELETE /api/models/{id}", a.handleDeleteModel)
 	mux.HandleFunc("GET /images/{session}/{file}", a.handleImage)
 }

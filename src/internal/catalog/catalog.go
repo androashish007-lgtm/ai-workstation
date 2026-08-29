@@ -27,6 +27,7 @@ type Entry struct {
 	Notes        string             `json:"notes,omitempty"`
 	Tier         int                `json:"tier"`              // 1=smallest/fastest .. higher=larger/better quality
 	Vision       bool               `json:"vision,omitempty"` // true for a vision-capable chat model or its paired encoder
+	PairWith     string             `json:"pair_with,omitempty"` // catalog id of a companion entry required alongside this one (e.g. a vision encoder) — downloading either one fetches both
 }
 
 type Catalog struct {
