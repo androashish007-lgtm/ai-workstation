@@ -9,6 +9,15 @@
   const attachInput = document.getElementById('attachInput');
   const attachPreview = document.getElementById('attachPreview');
   const newChatBtn = document.getElementById('newChatBtn');
+  const newProjectBtn = document.getElementById('newProjectBtn');
+  const deleteAllBtn = document.getElementById('deleteAllBtn');
+  const projectModal = document.getElementById('projectModal');
+  const projectModalTitle = document.getElementById('projectModalTitle');
+  const projectNameInput = document.getElementById('projectNameInput');
+  const projectNotesInput = document.getElementById('projectNotesInput');
+  const projectSaveBtn = document.getElementById('projectSaveBtn');
+  const projectCancelBtn = document.getElementById('projectCancelBtn');
+  const projectDeleteBtn = document.getElementById('projectDeleteBtn');
   const qrBtn = document.getElementById('qrBtn');
   const qrModal = document.getElementById('qrModal');
   const qrImg = document.getElementById('qrImg');
@@ -28,9 +37,19 @@
   // just this tab's live window into whichever session is currently shown;
   // switching sessions closes it and opens a new one for the newly-viewed
   // session, but never touches what's running server-side for any session.
-  let state = { sessions: [], activeId: null, session: null, attachmentDataURI: null };
+  let state = { sessions: [], projects: [], activeId: null, session: null, attachmentDataURI: null };
   let currentStream = null;
   let currentAssistantBubble = null;
+  let editingProjectId = null; // null while the "New project" flow is open
+
+  function loadCollapsedProjects() {
+    try { return new Set(JSON.parse(localStorage.getItem('collapsedProjects') || '[]')); }
+    catch (e) { return new Set(); }
+  }
+  function saveCollapsedProjects(set) {
+    try { localStorage.setItem('collapsedProjects', JSON.stringify([...set])); } catch (e) { /* private mode etc: skip */ }
+  }
+  const collapsedProjects = loadCollapsedProjects();
 
   async function api(path, opts) {
     const res = await fetch(path, opts);
@@ -50,6 +69,7 @@
   async function boot() {
     const data = await api('/api/bootstrap');
     state.sessions = data.sessions || [];
+    state.projects = data.projects || [];
     state.activeId = data.active_session_id;
     hwLineEl.textContent = `${data.hw.cpu_cores} cores · ${fmtBytes(data.hw.total_ram_bytes)} RAM` +
       (data.hw.gpu_vendor && data.hw.gpu_vendor !== 'none' ? ` · ${data.hw.gpu_vendor} GPU` : ' · CPU only');
@@ -60,23 +80,131 @@
 
   function renderSessionList() {
     sessionListEl.innerHTML = '';
+
+    const byProject = new Map();
+    const ungrouped = [];
     for (const s of state.sessions) {
-      const el = document.createElement('div');
-      el.className = 'session-item' + (s.id === state.activeId ? ' active' : '');
-      const title = document.createElement('span');
-      title.className = 'session-title';
-      title.textContent = s.title || 'New chat';
-      el.appendChild(title);
-      if (s.generating) {
-        const dot = document.createElement('span');
-        dot.className = 'session-generating-dot';
-        dot.title = 'Still working on a response';
-        el.appendChild(dot);
+      if (s.project_id) {
+        if (!byProject.has(s.project_id)) byProject.set(s.project_id, []);
+        byProject.get(s.project_id).push(s);
+      } else {
+        ungrouped.push(s);
       }
-      el.onclick = () => openSession(s.id);
-      sessionListEl.appendChild(el);
+    }
+
+    for (const p of state.projects) {
+      const group = document.createElement('div');
+      group.className = 'project-group';
+
+      const collapsed = collapsedProjects.has(p.id);
+      const header = document.createElement('div');
+      header.className = 'project-header' + (collapsed ? ' collapsed' : '');
+      header.innerHTML = `<span class="caret">▾</span><span class="project-name">${escapeHtml(p.name)}</span>`;
+
+      const addBtn = document.createElement('button');
+      addBtn.className = 'icon-btn';
+      addBtn.textContent = '+';
+      addBtn.title = 'New chat in this project';
+      addBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const s = await api('/api/sessions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ project_id: p.id }) });
+        state.sessions.unshift({ id: s.id, title: s.title, updated_at: s.updated_at, project_id: p.id, generating: false });
+        await openSession(s.id);
+      };
+      const editBtn = document.createElement('button');
+      editBtn.className = 'icon-btn';
+      editBtn.textContent = '✎';
+      editBtn.title = 'Edit project';
+      editBtn.onclick = (e) => { e.stopPropagation(); openProjectModal(p); };
+      header.appendChild(addBtn);
+      header.appendChild(editBtn);
+
+      header.onclick = () => {
+        if (collapsedProjects.has(p.id)) collapsedProjects.delete(p.id); else collapsedProjects.add(p.id);
+        saveCollapsedProjects(collapsedProjects);
+        renderSessionList();
+      };
+      group.appendChild(header);
+
+      const chatsEl = document.createElement('div');
+      chatsEl.className = 'project-chats' + (collapsed ? ' collapsed' : '');
+      for (const s of (byProject.get(p.id) || [])) {
+        chatsEl.appendChild(sessionItemEl(s));
+      }
+      group.appendChild(chatsEl);
+      sessionListEl.appendChild(group);
+    }
+
+    if (state.projects.length && ungrouped.length) {
+      const label = document.createElement('div');
+      label.className = 'ungrouped-label';
+      label.textContent = 'Chats';
+      sessionListEl.appendChild(label);
+    }
+    for (const s of ungrouped) {
+      sessionListEl.appendChild(sessionItemEl(s));
     }
   }
+
+  function sessionItemEl(s) {
+    const el = document.createElement('div');
+    el.className = 'session-item' + (s.id === state.activeId ? ' active' : '');
+    const title = document.createElement('span');
+    title.className = 'session-title';
+    title.textContent = s.title || 'New chat';
+    el.appendChild(title);
+    if (s.generating) {
+      const dot = document.createElement('span');
+      dot.className = 'session-generating-dot';
+      dot.title = 'Still working on a response';
+      el.appendChild(dot);
+    }
+    const delBtn = document.createElement('button');
+    delBtn.className = 'icon-btn';
+    delBtn.textContent = '✕';
+    delBtn.title = 'Delete this chat';
+    delBtn.onclick = (e) => { e.stopPropagation(); deleteChat(s.id, s.title); };
+    el.appendChild(delBtn);
+    el.onclick = () => openSession(s.id);
+    return el;
+  }
+
+  async function deleteChat(id, title) {
+    if (!confirm(`Delete "${title || 'this chat'}"? This can't be undone.`)) return;
+    try {
+      await api('/api/sessions/' + id, { method: 'DELETE' });
+    } catch (err) {
+      alert('Could not delete: ' + err.message);
+      return;
+    }
+    const wasActive = state.activeId === id;
+    await refreshSessionList();
+    if (wasActive) {
+      const next = state.sessions[0];
+      if (next) {
+        await openSession(next.id);
+      } else {
+        const s = await api('/api/sessions', { method: 'POST' });
+        state.sessions.unshift({ id: s.id, title: s.title, updated_at: s.updated_at, generating: false });
+        await openSession(s.id);
+      }
+    }
+  }
+
+  deleteAllBtn.onclick = async () => {
+    if (!confirm('Delete ALL chats? Chats currently generating a response will be skipped. This can\'t be undone.')) return;
+    let result;
+    try {
+      result = await api('/api/sessions', { method: 'DELETE' });
+    } catch (err) {
+      alert('Could not delete: ' + err.message);
+      return;
+    }
+    if (result.skipped) alert(`Deleted ${result.deleted} chat(s). Skipped ${result.skipped} still generating a response.`);
+    const s = await api('/api/sessions', { method: 'POST' });
+    state.sessions = [{ id: s.id, title: s.title, updated_at: s.updated_at, generating: false }];
+    await openSession(s.id);
+  };
 
   async function refreshSessionList() {
     try {
@@ -84,6 +212,61 @@
       renderSessionList();
     } catch (e) { /* non-fatal */ }
   }
+
+  async function refreshProjects() {
+    try {
+      state.projects = await api('/api/projects');
+      renderSessionList();
+    } catch (e) { /* non-fatal */ }
+  }
+
+  // --- Projects ---
+  function openProjectModal(project) {
+    editingProjectId = project ? project.id : null;
+    projectModalTitle.textContent = project ? 'Edit project' : 'New project';
+    projectNameInput.value = project ? project.name : '';
+    projectNotesInput.value = project ? project.notes : '';
+    projectDeleteBtn.hidden = !project;
+    projectModal.hidden = false;
+    projectNameInput.focus();
+  }
+  function closeProjectModal() { projectModal.hidden = true; editingProjectId = null; }
+
+  newProjectBtn.onclick = () => openProjectModal(null);
+  projectCancelBtn.onclick = closeProjectModal;
+  projectModal.onclick = (e) => { if (e.target === projectModal) closeProjectModal(); };
+
+  projectSaveBtn.onclick = async () => {
+    const name = projectNameInput.value.trim();
+    if (!name) { projectNameInput.focus(); return; }
+    const notes = projectNotesInput.value;
+    try {
+      if (editingProjectId) {
+        await api('/api/projects/' + editingProjectId, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, notes }) });
+      } else {
+        await api('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, notes }) });
+      }
+    } catch (err) {
+      alert('Could not save project: ' + err.message);
+      return;
+    }
+    closeProjectModal();
+    await refreshProjects();
+  };
+
+  projectDeleteBtn.onclick = async () => {
+    if (!editingProjectId) return;
+    if (!confirm('Delete this project? Its chats are kept, just ungrouped.')) return;
+    try {
+      await api('/api/projects/' + editingProjectId, { method: 'DELETE' });
+    } catch (err) {
+      alert('Could not delete project: ' + err.message);
+      return;
+    }
+    closeProjectModal();
+    await refreshSessionList();
+    await refreshProjects();
+  };
 
   // openSession is the single entry point for viewing a session: load its
   // saved history, render it, then (re)attach to its live stream — which
@@ -310,7 +493,11 @@
   };
   qrClose.onclick = closeQR;
   qrModal.onclick = (e) => { if (e.target === qrModal) closeQR(); };
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !qrModal.hidden) closeQR(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!qrModal.hidden) closeQR();
+    if (!projectModal.hidden) closeProjectModal();
+  });
 
   // --- System usage badge ---
   const ACTIVITY_LABELS = {

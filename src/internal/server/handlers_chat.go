@@ -244,7 +244,15 @@ func (a *App) generateText(ctx context.Context, gen *Generation, binPath string,
 }
 
 func (a *App) buildChatMessages(sess *session.Session, needVision bool) []engine.ChatMessage {
-	msgs := []engine.ChatMessage{{Role: "system", Content: systemPrompt}}
+	system := systemPrompt
+	if sess.ProjectID != "" {
+		if p, ok := a.projects.Get(sess.ProjectID); ok && strings.TrimSpace(p.Notes) != "" {
+			// Shared project context — same for every chat in this project,
+			// independent of that chat's own message history.
+			system += "\n\nShared context for this project (\"" + p.Name + "\"):\n" + p.Notes
+		}
+	}
+	msgs := []engine.ChatMessage{{Role: "system", Content: system}}
 	// Cap history so we don't blow the inferred context window on long sessions.
 	start := 0
 	if len(sess.Messages) > 20 {

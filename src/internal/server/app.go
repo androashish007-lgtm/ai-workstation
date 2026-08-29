@@ -18,6 +18,7 @@ import (
 	"aistation/internal/engine"
 	"aistation/internal/hw"
 	"aistation/internal/imageperf"
+	"aistation/internal/project"
 	"aistation/internal/registry"
 	"aistation/internal/session"
 	"aistation/internal/usagelog"
@@ -48,6 +49,7 @@ type App struct {
 	textPool    *TextPool
 	usageLog    *usagelog.Log
 	imagePerf   *imageperf.Store
+	projects    *project.Store
 
 	mu                    sync.Mutex
 	textBinPath           string
@@ -117,6 +119,7 @@ func NewApp(root string) (*App, error) {
 		textPool:    NewTextPool(profile),
 		usageLog:    usagelog.New(dirs.Data),
 		imagePerf:   imageperf.New(dirs.Data),
+		projects:    project.New(dirs.Data),
 	}, nil
 }
 
@@ -205,9 +208,15 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/engine/approve", a.handleEngineApprove)
 	mux.HandleFunc("GET /api/sessions", a.handleListSessions)
 	mux.HandleFunc("POST /api/sessions", a.handleNewSession)
+	mux.HandleFunc("DELETE /api/sessions", a.handleDeleteAllSessions)
 	mux.HandleFunc("GET /api/sessions/{id}", a.handleGetSession)
 	mux.HandleFunc("DELETE /api/sessions/{id}", a.handleDeleteSession)
+	mux.HandleFunc("PATCH /api/sessions/{id}", a.handlePatchSession)
 	mux.HandleFunc("GET /api/sessions/{id}/stream", a.handleSessionStream)
+	mux.HandleFunc("GET /api/projects", a.handleListProjects)
+	mux.HandleFunc("POST /api/projects", a.handleCreateProject)
+	mux.HandleFunc("PUT /api/projects/{id}", a.handleUpdateProject)
+	mux.HandleFunc("DELETE /api/projects/{id}", a.handleDeleteProject)
 	mux.HandleFunc("POST /api/chat", a.handleChat)
 	mux.HandleFunc("GET /api/qr", a.handleQR)
 	mux.HandleFunc("GET /api/lan-url", a.handleLANURL)

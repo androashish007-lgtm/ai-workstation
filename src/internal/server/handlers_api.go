@@ -11,6 +11,7 @@ import (
 	"aistation/internal/catalog"
 	"aistation/internal/download"
 	"aistation/internal/engine"
+	"aistation/internal/project"
 	"aistation/internal/registry"
 	"aistation/internal/safego"
 	"aistation/internal/session"
@@ -101,6 +102,7 @@ type bootstrapResponse struct {
 	TextEngine       any                  `json:"text_engine"`
 	ImageEngine      any                  `json:"image_engine"`
 	Sessions         []SessionSummaryView `json:"sessions"`
+	Projects         []project.Project    `json:"projects"`
 	ActiveSessionID  string               `json:"active_session_id"`
 }
 
@@ -129,7 +131,7 @@ func (a *App) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 
 	activeID := cfg.ActiveSessionID
 	if activeID == "" || !sessionExists(sessions, activeID) {
-		s := a.sessions.New()
+		s := a.sessions.New("")
 		a.sessions.Save(s)
 		activeID = s.ID
 		cfg.ActiveSessionID = activeID
@@ -145,6 +147,7 @@ func (a *App) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 		TextEngine:       textState,
 		ImageEngine:      imageState,
 		Sessions:         a.withGeneratingFlag(sessions),
+		Projects:         a.projects.List(),
 		ActiveSessionID:  activeID,
 	})
 }
@@ -272,7 +275,17 @@ func (a *App) handleListSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) handleNewSession(w http.ResponseWriter, r *http.Request) {
-	s := a.sessions.New()
+	var body struct {
+		ProjectID string `json:"project_id"`
+	}
+	json.NewDecoder(r.Body).Decode(&body) // optional body; empty/absent is fine
+	if body.ProjectID != "" {
+		if _, ok := a.projects.Get(body.ProjectID); !ok {
+			http.Error(w, "unknown project_id", http.StatusNotFound)
+			return
+		}
+	}
+	s := a.sessions.New(body.ProjectID)
 	if err := a.sessions.Save(s); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -302,8 +315,139 @@ func (a *App) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid id", http.StatusBadRequest)
 		return
 	}
+	if _, active := a.generations.Get(id); active {
+		http.Error(w, "this chat is still generating a response — wait for it to finish before deleting", http.StatusConflict)
+		return
+	}
+	a.deleteSessionFiles(id)
+	a.clearActiveIfDeleted(id)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDeleteAllSessions deletes every chat except any currently
+// generating a response (those are skipped, not force-stopped) and reports
+// how many of each.
+func (a *App) handleDeleteAllSessions(w http.ResponseWriter, r *http.Request) {
+	list, err := a.sessions.List()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	active := a.generations.ActiveSessions()
+	deleted, skipped := 0, 0
+	for _, s := range list {
+		if active[s.ID] {
+			skipped++
+			continue
+		}
+		a.deleteSessionFiles(s.ID)
+		a.clearActiveIfDeleted(s.ID)
+		deleted++
+	}
+	writeJSON(w, map[string]any{"deleted": deleted, "skipped": skipped})
+}
+
+func (a *App) deleteSessionFiles(id string) {
 	os.Remove(filepath.Join(a.dirs.Sessions, id+".json"))
 	os.RemoveAll(filepath.Join(a.dirs.Images, id))
+}
+
+func (a *App) clearActiveIfDeleted(id string) {
+	cfg := a.config.Load()
+	if cfg.ActiveSessionID == id {
+		cfg.ActiveSessionID = ""
+		a.config.Save(cfg)
+	}
+}
+
+// handlePatchSession currently supports moving a chat into/out of a
+// project ({"project_id": "..."} or {"project_id": ""} to ungroup).
+func (a *App) handlePatchSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var body struct {
+		ProjectID *string `json:"project_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	s, err := a.sessions.Load(id)
+	if err != nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	if body.ProjectID != nil {
+		if *body.ProjectID != "" {
+			if _, ok := a.projects.Get(*body.ProjectID); !ok {
+				http.Error(w, "unknown project_id", http.StatusNotFound)
+				return
+			}
+		}
+		s.ProjectID = *body.ProjectID
+	}
+	if err := a.sessions.Save(s); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, s)
+}
+
+func (a *App) handleListProjects(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, a.projects.List())
+}
+
+func (a *App) handleCreateProject(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Name  string `json:"name"`
+		Notes string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	p := a.projects.Create(strings.TrimSpace(body.Name), body.Notes)
+	writeJSON(w, p)
+}
+
+func (a *App) handleUpdateProject(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var body struct {
+		Name  string `json:"name"`
+		Notes string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		http.Error(w, "name is required", http.StatusBadRequest)
+		return
+	}
+	p, ok := a.projects.Update(id, strings.TrimSpace(body.Name), body.Notes)
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	writeJSON(w, p)
+}
+
+// handleDeleteProject deletes the project but never the chats inside it —
+// they're ungrouped back to the top level instead, since a "delete this
+// grouping" action shouldn't silently take conversations with it.
+func (a *App) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if !a.projects.Delete(id) {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	list, _ := a.sessions.List()
+	for _, summary := range list {
+		if summary.ProjectID != id {
+			continue
+		}
+		s, err := a.sessions.Load(summary.ID)
+		if err != nil {
+			continue
+		}
+		s.ProjectID = ""
+		a.sessions.Save(s)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

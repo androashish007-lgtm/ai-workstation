@@ -39,12 +39,14 @@ type Session struct {
 	UpdatedAt   time.Time `json:"updated_at"`
 	LastTextID  string    `json:"last_text_model_id,omitempty"`
 	LastImageID string    `json:"last_image_model_id,omitempty"`
+	ProjectID   string    `json:"project_id,omitempty"`
 }
 
 type Summary struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"title"`
 	UpdatedAt time.Time `json:"updated_at"`
+	ProjectID string    `json:"project_id,omitempty"`
 }
 
 type Manager struct {
@@ -61,10 +63,10 @@ func (m *Manager) path(id string) string {
 	return filepath.Join(m.dir, id+".json")
 }
 
-func (m *Manager) New() *Session {
+func (m *Manager) New(projectID string) *Session {
 	now := time.Now()
 	id := fmt.Sprintf("%d", now.UnixNano())
-	return &Session{ID: id, Title: "New chat", CreatedAt: now, UpdatedAt: now}
+	return &Session{ID: id, Title: "New chat", CreatedAt: now, UpdatedAt: now, ProjectID: projectID}
 }
 
 func (m *Manager) Load(id string) (*Session, error) {
@@ -113,7 +115,7 @@ func (m *Manager) List() ([]Summary, error) {
 		if err != nil {
 			continue
 		}
-		out = append(out, Summary{ID: s.ID, Title: s.Title, UpdatedAt: s.UpdatedAt})
+		out = append(out, Summary{ID: s.ID, Title: s.Title, UpdatedAt: s.UpdatedAt, ProjectID: s.ProjectID})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
 	return out, nil

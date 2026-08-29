@@ -14,7 +14,10 @@
 
   <div id="app">
     <aside id="sidebar">
-      <button id="newChatBtn" class="new-chat-btn">+ New chat</button>
+      <div class="sidebar-new-row">
+        <button id="newChatBtn" class="new-chat-btn">+ New chat</button>
+        <button id="newProjectBtn" class="new-project-btn" title="New project (group chats with shared context)">+ Project</button>
+      </div>
       <div id="sessionList" class="session-list"></div>
       <div class="sidebar-footer">
         <div class="tab-row">
@@ -22,6 +25,7 @@
           <button id="tabUsage" class="tab-btn">Model usage</button>
         </div>
         <button id="qrBtn" title="Show LAN access QR code">📱 Phone access</button>
+        <button id="deleteAllBtn" class="danger-btn" title="Delete every chat">🗑 Delete all chats</button>
         <div id="hwLine" class="hw-line"></div>
       </div>
     </aside>
@@ -54,6 +58,22 @@
       <img id="qrImg" alt="QR code">
       <div id="qrUrl" class="qr-url"></div>
       <button id="qrClose">Close</button>
+    </div>
+  </div>
+
+  <div id="projectModal" class="modal" hidden>
+    <div class="modal-card modal-card-wide">
+      <h3 id="projectModalTitle">New project</h3>
+      <p class="hw-line">Chats you put in this project all see the notes below as shared background
+        context — they still each have their own separate conversation.</p>
+      <input id="projectNameInput" type="text" placeholder="Project name" class="project-input">
+      <textarea id="projectNotesInput" placeholder="Shared context / instructions for every chat in this project…" rows="6" class="project-input"></textarea>
+      <div class="modal-actions">
+        <button id="projectDeleteBtn" class="danger-btn" hidden>Delete project</button>
+        <span class="modal-actions-spacer"></span>
+        <button id="projectCancelBtn" class="secondary-btn">Cancel</button>
+        <button id="projectSaveBtn">Save</button>
+      </div>
     </div>
   </div>
 

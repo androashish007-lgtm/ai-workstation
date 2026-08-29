@@ -76,6 +76,25 @@ still working even though you're looking at something else; switch back any
 time and it'll be there, mid-response or finished. Which model answered is
 shown as a small label above its response.
 
+## Deleting chats
+
+Hover a chat in the sidebar for a **✕** to delete it (with confirmation).
+**🗑 Delete all chats** in the sidebar footer clears everything at once —
+any chat still generating a response is skipped rather than force-stopped,
+and you're told how many were skipped.
+
+## Projects (grouped chats with shared context)
+
+Click **+ Project** to create a named group with shared notes/instructions
+— e.g. "Building a portfolio site for a photographer, minimal dark theme."
+Every chat you create inside that project (via the **+** on its group
+header) automatically gets those notes as background context, on top of
+its own independent conversation — so you don't have to repeat the same
+background in every chat. Chats keep entirely separate histories; only the
+shared notes are common. Editing a project's notes (✎) affects every chat
+in it going forward; deleting a project ungroups its chats rather than
+deleting them.
+
 ## Model usage
 
 The **Model usage** tab (sidebar, next to Chat) shows which installed
