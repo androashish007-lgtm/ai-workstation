@@ -75,6 +75,7 @@ func StartTextServer(ctx context.Context, binPath, modelPath string, ctxTokens, 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("starting llama-server: %w", err)
 	}
+	assignToJobObject(cmd.Process)
 
 	// Watched concurrently with health polling so a fast crash (e.g. a
 	// corrupt/incompatible model file) fails immediately with the engine's

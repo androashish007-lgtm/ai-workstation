@@ -272,10 +272,38 @@ func (a *App) generateText(ctx context.Context, gen *Generation, binPath string,
 		mmproj = filepath.Join(a.dirs.ModelsText, model.PairedProjector)
 	}
 
-	for attempt := 0; attempt < 2; attempt++ {
+	// stepDown picks the retry lever that actually addresses what just
+	// failed: a GPU allocation crash needs less GPU offload (the graduated
+	// ladder), not a smaller context — trimming context/tokens wouldn't
+	// have prevented a failure that happened while loading model weights
+	// onto the GPU, before any request-specific memory was even involved.
+	// Anything else (a generic CPU/RAM problem, an empty/failed stream)
+	// gets the context/token trim instead, since GPU offload wasn't the
+	// resource under pressure. gpuLadderDone latches once the GPU ladder
+	// bottoms out at 0, so a later non-GPU failure doesn't re-walk it.
+	gpuLadderDone := params.GPULayers == 0
+	stepDown := func(errText string) {
+		if !gpuLadderDone && params.GPULayers > 0 && router.IsGPUAllocationFailure(errText) {
+			var done bool
+			params, done = params.StepDownGPU()
+			gpuLadderDone = done
+			return
+		}
+		params = params.StepDown()
+	}
+
+	var lastErr error
+	// Generous enough to walk the full GPU offload ladder down to CPU-only
+	// (router.gpuLayerLadder has 5 rungs) plus a few generic context/token
+	// retries after that — each failed attempt fails fast (the engine
+	// crashes almost immediately on a bad allocation rather than hanging),
+	// so extra headroom here costs very little in the failure case.
+	const maxTextGenerationAttempts = 8
+	for attempt := 0; attempt < maxTextGenerationAttempts; attempt++ {
 		tp, release, started, err := a.textPool.Acquire(binPath, model, params, mmproj)
 		if err != nil {
-			params = params.StepDown()
+			lastErr = fmt.Errorf("starting/acquiring model instance: %w", err)
+			stepDown(err.Error())
 			continue
 		}
 		messages := a.buildChatMessages(sess, needVision)
@@ -284,16 +312,17 @@ func (a *App) generateText(ctx context.Context, gen *Generation, binPath string,
 			release()
 			if started {
 				a.textPool.Discard(model, mmproj)
-				params = params.StepDown()
+				lastErr = fmt.Errorf("starting chat stream: %w", err)
+				stepDown(err.Error())
 				continue
 			}
 			return "", fmt.Errorf("shared model instance rejected the request: %w", err)
 		}
 		var out strings.Builder
-		streamFailed := false
+		var streamErr error
 		for ev := range stream {
 			if ev.Err != nil {
-				streamFailed = true
+				streamErr = ev.Err
 				break
 			}
 			if ev.Delta != "" {
@@ -306,17 +335,26 @@ func (a *App) generateText(ctx context.Context, gen *Generation, binPath string,
 			}
 		}
 		release()
-		if streamFailed || out.Len() == 0 {
+		if streamErr != nil || out.Len() == 0 {
 			if started {
 				a.textPool.Discard(model, mmproj)
-				params = params.StepDown()
+				if streamErr != nil {
+					lastErr = fmt.Errorf("streaming response: %w", streamErr)
+					stepDown(streamErr.Error())
+				} else {
+					lastErr = fmt.Errorf("model produced an empty response")
+					stepDown("")
+				}
 				continue
 			}
 			return "", fmt.Errorf("generation failed on a shared model instance")
 		}
 		return out.String(), nil
 	}
-	return "", fmt.Errorf("generation failed after retry with reduced settings")
+	if lastErr != nil {
+		return "", fmt.Errorf("generation failed after retrying with reduced settings: %w", lastErr)
+	}
+	return "", fmt.Errorf("generation failed after retrying with reduced settings")
 }
 
 func (a *App) buildChatMessages(sess *session.Session, needVision bool) []engine.ChatMessage {
@@ -505,6 +543,7 @@ func (a *App) generateImage(ctx context.Context, opID string, binPath string, mo
 		a.calibrateImagePerf(ctx, binPath, model, params.Width, params.Height, threads, time.Until(deadline))
 	}
 
+	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		remaining := time.Until(deadline)
 		if remaining < 30*time.Second {
@@ -539,7 +578,11 @@ func (a *App) generateImage(ctx context.Context, opID string, binPath string, mo
 		if err == nil {
 			return result.PNG, nil
 		}
+		lastErr = err // kept so a total failure below explains why, not just "ran out of time/attempts"
 		params = params.StepDown()
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("could not finish within the %s budget on this hardware: %w", imageTotalBudget, lastErr)
 	}
 	return nil, fmt.Errorf("could not finish within the %s budget on this hardware", imageTotalBudget)
 }

@@ -233,17 +233,72 @@ func InferTextParams(model registry.Model, profile hw.Profile, promptLen int, co
 	return TextParams{ContextTokens: ctx, MaxTokens: maxTokens, Temperature: 0.7, GPULayers: gpuLayers}
 }
 
-// StepDown produces a smaller, safer parameter set after an OOM/load
-// failure, so the caller can retry once automatically instead of
-// surfacing a raw error.
+// StepDown produces a smaller, safer parameter set after a failure that
+// isn't specifically a GPU allocation error (see StepDownGPU for that
+// case) — shrinking context/output-length trims the CPU-RAM footprint
+// (KV-cache scales with context size) without touching GPU offload.
 func (p TextParams) StepDown() TextParams {
 	next := p
 	next.ContextTokens = maxInt(1024, p.ContextTokens/2)
 	next.MaxTokens = maxInt(256, p.MaxTokens/2)
-	if p.GPULayers > 0 {
-		next.GPULayers = maxInt(0, p.GPULayers/2)
-	}
 	return next
+}
+
+// gpuLayerLadder is the sequence of --n-gpu-layers values tried after a
+// GPU allocation failure, most to least aggressive. These are absolute
+// layer counts, not fractions of the model's real layer count (which this
+// process never sees — llama.cpp clamps a too-large request down to
+// "all layers" internally) — so each rung is just "meaningfully less than
+// the last", ending at 0 (CPU-only), which is guaranteed to work given
+// enough system RAM. 999 (the conventional "offload everything" sentinel)
+// is intentionally NOT repeated here since StepDownGPU is only ever
+// called after that first full-offload attempt already failed.
+var gpuLayerLadder = []int{20, 10, 5, 2, 0}
+
+// StepDownGPU tries the next rung down the GPU-offload ladder rather than
+// halving: how much a GPU backend can actually allocate isn't something
+// this process can query (Vulkan exposes no reliable "free memory" check,
+// especially on an integrated GPU where the real ceiling is whatever the
+// driver/BIOS decided to expose — often far less than total system RAM),
+// and llama.cpp/Vulkan hard-crashes on an allocation failure rather than
+// gracefully falling back on its own. A blind halving from a large
+// starting value (e.g. 999 -> 499) can still be too big and just repeats
+// the same crash; stepping through explicit small rungs down to 0
+// guarantees eventual success while still giving a real chance of
+// keeping *some* GPU acceleration rather than jumping straight to
+// CPU-only. done reports true once the ladder is exhausted (already at
+// 0) — the caller should fall through to StepDown()'s context-trimming
+// route instead of retrying a GPU config again.
+func (p TextParams) StepDownGPU() (TextParams, bool) {
+	next := p
+	for _, rung := range gpuLayerLadder {
+		if rung < p.GPULayers {
+			next.GPULayers = rung
+			return next, false
+		}
+	}
+	next.GPULayers = 0
+	return next, p.GPULayers == 0
+}
+
+// IsGPUAllocationFailure reports whether an error looks like the engine
+// crashed trying to allocate GPU memory, as opposed to a general
+// system-RAM/CPU problem — the two need different responses (retry with
+// less GPU offload vs. retry with a smaller context/output size), and a
+// plain substring match on the captured process output is the most
+// reliable signal available (llama.cpp/Vulkan doesn't expose a typed
+// error here, just this text on stderr).
+func IsGPUAllocationFailure(errText string) bool {
+	t := strings.ToLower(errText)
+	for _, sig := range []string{
+		"vulkan", "out of device memory", "outofdevicememory",
+		"ggml_vulkan", "cuda out of memory", "cuda error",
+	} {
+		if strings.Contains(t, sig) {
+			return true
+		}
+	}
+	return false
 }
 
 func maxInt(a, b int) int {
