@@ -18,6 +18,8 @@ type Usage struct {
 	RAMUsedBytes  uint64  `json:"ram_used_bytes"`
 	RAMTotalBytes uint64  `json:"ram_total_bytes"`
 	CPUAvailable  bool    `json:"cpu_available"` // false until the first valid CPU sample (or if unsupported); RAM is still filled in
+	GPUPercent    float64 `json:"gpu_percent"`
+	GPUAvailable  bool    `json:"gpu_available"` // false until the first valid GPU sample (or if unsupported on this OS)
 }
 
 type UsageSampler struct {
@@ -38,16 +40,50 @@ func (s *UsageSampler) Latest() Usage {
 // Start runs the sampling loop until stop is closed. Call it in its own
 // goroutine; a failed sample just keeps the previous value rather than
 // crashing the loop — usage reporting is cosmetic, never load-bearing.
+//
+// GPU utilization is sampled on its own slower, non-blocking ticker: unlike
+// CPU/RAM, querying it (on Windows, via the same performance counter set
+// Task Manager's GPU tab reads) costs on the order of a second each time —
+// running it on the 1s CPU/RAM cadence would mean it's *always* running,
+// which is both wasteful and would lag the CPU/RAM numbers behind it.
 func (s *UsageSampler) Start(stop <-chan struct{}) {
 	s.tick()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+
+	gpuTicker := time.NewTicker(6 * time.Second)
+	defer gpuTicker.Stop()
+	var gpuMu sync.Mutex
+	gpuInFlight := false
+
 	for {
 		select {
 		case <-stop:
 			return
 		case <-ticker.C:
 			s.tick()
+		case <-gpuTicker.C:
+			gpuMu.Lock()
+			if gpuInFlight {
+				gpuMu.Unlock()
+				continue // previous sample still running; skip this tick rather than pile up
+			}
+			gpuInFlight = true
+			gpuMu.Unlock()
+			go func() {
+				defer func() {
+					recover() // sampleGPUPercent shouldn't panic, but this is best-effort cosmetics — never take the app down over it
+					gpuMu.Lock()
+					gpuInFlight = false
+					gpuMu.Unlock()
+				}()
+				if pct, ok := sampleGPUPercent(); ok {
+					s.mu.Lock()
+					s.latest.GPUPercent = pct
+					s.latest.GPUAvailable = true
+					s.mu.Unlock()
+				}
+			}()
 		}
 	}
 }

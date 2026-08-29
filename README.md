@@ -104,6 +104,23 @@ The **Model usage** tab (sidebar, next to Chat) shows which installed
 models actually get used, most to least, based on real requests — not
 guesswork. Nothing here is configurable; it's purely informational.
 
+## GPU detection
+
+On Windows, GPU vendor/name is read via PowerShell's `Get-CimInstance` (the
+`GPU vendor`/`GPU name` line in the startup log confirms what was found).
+When a GPU is detected and Vulkan is available, both engines automatically
+download the Vulkan-accelerated build instead of CPU-only — this covers
+Intel integrated graphics (including Iris Xe), AMD, and NVIDIA alike from
+one backend, rather than needing a vendor-specific toolkit like CUDA or
+OpenVINO. The status badge (top-right) shows live GPU utilization next to
+CPU/RAM when a GPU is present, sampled every ~6s (the underlying Windows
+counter is inherently slow to query, so it's deliberately not on the
+same 1s cadence as CPU/RAM).
+
+If you already had engines downloaded before upgrading to a version with
+this fix, delete `engines/<platform>/` once to force a fresh bootstrap —
+otherwise the app keeps using whatever was already downloaded.
+
 ## Image generation timing
 
 Image requests are given a 10-minute ceiling, no matter how slow the

@@ -563,6 +563,9 @@
       const cpu = u.cpu_available ? Math.round(u.cpu_percent) + '%' : '–';
       const ram = Math.round(u.ram_percent) + '%';
       let label = 'CPU ' + cpu + ' · RAM ' + ram;
+      if (u.gpu_vendor && u.gpu_vendor !== 'none') {
+        label += ' · GPU ' + (u.gpu_available ? Math.round(u.gpu_percent) + '%' : '–');
+      }
       const act = u.activity || {};
       const activityLabel = ACTIVITY_LABELS[act.kind];
 
@@ -574,9 +577,11 @@
         if (act.possibly_stuck) label += ' (taking longer than usual)';
       }
       statusText.textContent = label;
-      statusBadge.title = act.possibly_stuck
+      let title = act.possibly_stuck
         ? 'Still running, but slower than expected — this can happen on a big model with no GPU. No action needed unless it never finishes.'
         : 'System load';
+      if (u.gpu_name) title += '\nGPU: ' + u.gpu_name + (u.gpu_available ? '' : ' (live % not available on this OS)');
+      statusBadge.title = title;
     } catch (e) {
       // Cosmetic feature: fail silent, keep showing the last good reading.
     }

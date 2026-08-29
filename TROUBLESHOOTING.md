@@ -61,6 +61,24 @@ delete it from `models/text/` (or `models/image/`) and let the chat UI's
 "no model installed" suggestion offer one sized correctly for your
 hardware.
 
+## Image generation maxes out CPU and never touches the GPU
+
+Check the startup log line: `hardware: ... GPU=none` means detection
+didn't find your GPU (older builds used `wmic`, which recent Windows 11
+updates removed entirely — fixed by switching to PowerShell's
+`Get-CimInstance`; if you still see `GPU=none` on a current build with a
+real GPU present, that's worth reporting). `GPU=<vendor> (<name>)` means it
+was found — if generation is still CPU-only after that, the engine binaries
+already on disk from before were downloaded CPU-only; delete
+`engines/<platform>/` to force a fresh Vulkan-build download next launch
+(see "GPU detection" in `README.md`).
+
+To confirm the GPU is actually being used during a real generation:
+open Task Manager → **Performance** tab → your GPU → watch the **3D** (or
+**Compute**) graph spike while an image is generating, or check the
+**Processes** tab's GPU column for the `sd-cli` process specifically. The
+app's own status badge (top-right) also shows live GPU % once detected.
+
 ## Permission errors per OS
 
 - **Windows**: if the binary won't run from a USB drive, right-click it →

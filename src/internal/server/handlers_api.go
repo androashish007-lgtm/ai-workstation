@@ -32,6 +32,10 @@ type systemUsageResponse struct {
 	RAMUsedBytes  uint64           `json:"ram_used_bytes"`
 	RAMTotalBytes uint64           `json:"ram_total_bytes"`
 	CPUAvailable  bool             `json:"cpu_available"`
+	GPUPercent    float64          `json:"gpu_percent"`
+	GPUAvailable  bool             `json:"gpu_available"`
+	GPUVendor     string           `json:"gpu_vendor"`
+	GPUName       string           `json:"gpu_name"`
 	Activity      ActivitySnapshot `json:"activity"`
 }
 
@@ -56,6 +60,10 @@ func (a *App) handleSystemUsage(w http.ResponseWriter, r *http.Request) {
 		RAMUsedBytes:  u.RAMUsedBytes,
 		RAMTotalBytes: u.RAMTotalBytes,
 		CPUAvailable:  u.CPUAvailable,
+		GPUPercent:    u.GPUPercent,
+		GPUAvailable:  u.GPUAvailable,
+		GPUVendor:     string(a.profile.GPUVendor),
+		GPUName:       a.profile.GPUName,
 		Activity:      act,
 	})
 }
