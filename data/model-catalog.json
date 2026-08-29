@@ -1,0 +1,70 @@
+{
+  "entries": [
+    {
+      "id": "qwen2.5-1.5b-instruct-q4km",
+      "name": "Qwen2.5 1.5B Instruct (Q4_K_M)",
+      "kind": "text",
+      "url": "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf?download=true",
+      "sha256": "1adf0b11065d8ad2e8123ea110d1ec956dab4ab038eab665614adba04b6c3370",
+      "size_bytes": 986048768,
+      "min_ram_bytes": 1610612736,
+      "notes": "Small/fast fallback model for low-RAM hardware and short, simple requests.",
+      "tier": 1
+    },
+    {
+      "id": "qwen2.5-7b-instruct-q4km",
+      "name": "Qwen2.5 7B Instruct (Q4_K_M)",
+      "kind": "text",
+      "url": "https://huggingface.co/bartowski/Qwen2.5-7B-Instruct-GGUF/resolve/main/Qwen2.5-7B-Instruct-Q4_K_M.gguf?download=true",
+      "sha256": "65b8fcd92af6b4fefa935c625d1ac27ea29dcb6ee14589c55a8f115ceaaa1423",
+      "size_bytes": 4683074240,
+      "min_ram_bytes": 6979321856,
+      "notes": "Balanced general-purpose chat model, good default for 16GB+ RAM machines.",
+      "tier": 2
+    },
+    {
+      "id": "qwen2.5-14b-instruct-q4km",
+      "name": "Qwen2.5 14B Instruct (Q4_K_M)",
+      "kind": "text",
+      "url": "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf?download=true",
+      "sha256": "e47ad95dad6ff848b431053b375adb5d39321290ea2c638682577dafca87c008",
+      "size_bytes": 8988110976,
+      "min_ram_bytes": 12884901888,
+      "notes": "Higher-quality model for complex requests on 32GB+ RAM or GPU machines.",
+      "tier": 3
+    },
+    {
+      "id": "qwen2-vl-7b-instruct-q4km",
+      "name": "Qwen2-VL 7B Instruct (Q4_K_M) — main model",
+      "kind": "text",
+      "url": "https://huggingface.co/second-state/Qwen2-VL-7B-Instruct-GGUF/resolve/main/Qwen2-VL-7B-Instruct-Q4_K_M.gguf?download=true",
+      "sha256": "5e9d63f2419285a0d76c5da15f12a1e2f9f0f79096458a541d8c7f47efe5bc2e",
+      "size_bytes": 4683072416,
+      "min_ram_bytes": 6979321856,
+      "notes": "Vision-capable chat model. Install together with its vision-encoder entry — the registry auto-pairs them by filename so images work in chat.",
+      "tier": 2
+    },
+    {
+      "id": "qwen2-vl-7b-instruct-vision-encoder",
+      "name": "Qwen2-VL 7B Instruct — vision encoder (required for image understanding)",
+      "kind": "text",
+      "url": "https://huggingface.co/second-state/Qwen2-VL-7B-Instruct-GGUF/resolve/main/Qwen2-VL-7B-Instruct-vision-encoder.gguf?download=true",
+      "sha256": "e315ed7aea5d835dd1dbee376b4f89478c240f56957901081d27e636a029e88b",
+      "size_bytes": 2703066624,
+      "min_ram_bytes": 3221225472,
+      "notes": "Pairs automatically with the Qwen2-VL 7B Instruct main model above.",
+      "tier": 2
+    },
+    {
+      "id": "sd15-pruned-emaonly-q8",
+      "name": "Stable Diffusion 1.5 (Q8_0)",
+      "kind": "image",
+      "url": "https://huggingface.co/second-state/stable-diffusion-v1-5-GGUF/resolve/main/stable-diffusion-v1-5-pruned-emaonly-Q8_0.gguf?download=true",
+      "sha256": "d0555243938c62faeefb4ac93f6c7a053ad373a4290c5256bce229aeb193bf94",
+      "size_bytes": 1763578176,
+      "min_ram_bytes": 3221225472,
+      "notes": "Self-contained single-file checkpoint (no separate VAE/text-encoder needed) — default image model for most hardware.",
+      "tier": 1
+    }
+  ]
+}

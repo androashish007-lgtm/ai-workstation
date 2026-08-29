@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Workstation</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="statusBadge" class="status-badge" title="System load">
+    <span id="statusDot" class="status-dot"></span>
+    <span id="statusText" class="status-text">CPU –% · RAM –%</span>
+  </div>
+
+  <div id="app">
+    <aside id="sidebar">
+      <button id="newChatBtn" class="new-chat-btn">+ New chat</button>
+      <div id="sessionList" class="session-list"></div>
+      <div class="sidebar-footer">
+        <div class="tab-row">
+          <button id="tabChat" class="tab-btn active">Chat</button>
+          <button id="tabUsage" class="tab-btn">Model usage</button>
+        </div>
+        <button id="qrBtn" title="Show LAN access QR code">📱 Phone access</button>
+        <div id="hwLine" class="hw-line"></div>
+      </div>
+    </aside>
+    <main id="main">
+      <div id="chatPanel" class="panel">
+        <div id="messages"></div>
+        <div id="suggestionArea"></div>
+        <form id="composer">
+          <textarea id="input" placeholder="Message the assistant — text or image, it figures out which…" rows="1"></textarea>
+          <label id="attachBtn" class="attach-btn" title="Attach an image">
+            📎<input id="attachInput" type="file" accept="image/*" hidden>
+          </label>
+          <button id="sendBtn" type="submit">Send</button>
+        </form>
+        <div id="attachPreview" class="attach-preview" hidden></div>
+      </div>
+      <div id="usagePanel" class="panel" hidden>
+        <div class="usage-header">
+          <h2>Model usage</h2>
+          <p class="hw-line">How often each installed model has actually been used, most to least.</p>
+        </div>
+        <div id="usageTable" class="usage-table"></div>
+      </div>
+    </main>
+  </div>
+
+  <div id="qrModal" class="modal" hidden>
+    <div class="modal-card">
+      <h3>Scan to open on your phone/tablet</h3>
+      <img id="qrImg" alt="QR code">
+      <div id="qrUrl" class="qr-url"></div>
+      <button id="qrClose">Close</button>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

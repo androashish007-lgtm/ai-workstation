@@ -1,0 +1,89 @@
+// Package catalog holds a small, curated, hardware-tier -> recommended-model
+// manifest shipped with the app (data/model-catalog.json), and compares it
+// against what's currently registered so the UI can suggest a download
+// instead of requiring the user to go find models themselves. Nothing here
+// ever downloads on its own — Suggest only returns candidates; the caller
+// downloads only after explicit UI approval.
+package catalog
+
+import (
+	"encoding/json"
+	"os"
+	"sort"
+
+	"aistation/internal/hw"
+	"aistation/internal/registry"
+)
+
+type Entry struct {
+	ID           string             `json:"id"`
+	Name         string             `json:"name"`
+	Kind         registry.ModelKind `json:"kind"`
+	URL          string             `json:"url"`
+	SHA256       string             `json:"sha256,omitempty"`
+	SizeBytes    int64              `json:"size_bytes"`
+	MinRAMBytes  uint64             `json:"min_ram_bytes"`
+	MinVRAMBytes uint64             `json:"min_vram_bytes,omitempty"`
+	Notes        string             `json:"notes,omitempty"`
+	Tier         int                `json:"tier"` // 1=smallest/fastest .. higher=larger/better quality
+}
+
+type Catalog struct {
+	Entries []Entry `json:"entries"`
+}
+
+func Load(path string) (*Catalog, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var c Catalog
+	if err := json.Unmarshal(b, &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// Suggest returns catalog entries of the requested kind that (a) fit the
+// given hardware profile and (b) are not already installed (matched by
+// checksum against the registry), best tier first. limit caps how many
+// suggestions come back so the UI isn't flooded.
+func Suggest(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed []registry.Model, limit int) []Entry {
+	have := map[string]bool{}
+	for _, m := range installed {
+		if m.SHA256 != "" {
+			have[m.SHA256] = true
+		}
+	}
+	budget := profile.BudgetBytes()
+	var candidates []Entry
+	for _, e := range c.Entries {
+		if e.Kind != kind {
+			continue
+		}
+		if e.SHA256 != "" && have[e.SHA256] {
+			continue
+		}
+		if e.MinRAMBytes > 0 && budget > 0 && e.MinRAMBytes > budget {
+			continue
+		}
+		if e.MinVRAMBytes > 0 && profile.VRAMBytes > 0 && e.MinVRAMBytes > profile.VRAMBytes {
+			continue
+		}
+		candidates = append(candidates, e)
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].Tier > candidates[j].Tier })
+	if limit > 0 && len(candidates) > limit {
+		candidates = candidates[:limit]
+	}
+	return candidates
+}
+
+// BestFit returns the single best entry the hardware can run, or nil.
+func BestFit(c *Catalog, kind registry.ModelKind, profile hw.Profile, installed []registry.Model) *Entry {
+	s := Suggest(c, kind, profile, installed, 1)
+	if len(s) == 0 {
+		return nil
+	}
+	return &s[0]
+}

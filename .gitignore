@@ -1,0 +1,24 @@
+# Model weights — large, user-supplied, never belong in git
+models/text/*
+models/image/*
+!models/text/.gitkeep
+!models/image/.gitkeep
+
+# Downloaded/built engine binaries (llama.cpp, stable-diffusion.cpp) — fetched on first run
+engines/*
+!engines/.gitkeep
+
+# Runtime state: chat history, registry, usage logs, downloads-in-progress — all local/personal
+data/*
+!data/model-catalog.json
+!data/.gitkeep
+
+# Go build artifacts
+src/*.exe
+src/*.test
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.log
+.claude/
