@@ -61,7 +61,7 @@ func (a *App) handleChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
-	gen, ok := a.generations.Start(sess.ID)
+	gen, genCtx, ok := a.generations.Start(sess.ID)
 	if !ok {
 		http.Error(w, "a response is already being generated for this chat", http.StatusConflict)
 		return
@@ -69,7 +69,7 @@ func (a *App) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	safego.Go(func() {
 		defer a.generations.Finish(sess.ID, gen)
-		a.runChatTurn(context.Background(), gen, sess, body)
+		a.runChatTurn(genCtx, gen, sess, body)
 	})
 
 	w.WriteHeader(http.StatusAccepted)
@@ -89,6 +89,10 @@ func (a *App) runChatTurn(ctx context.Context, gen *Generation, sess *session.Se
 	}
 	sess.Messages = append(sess.Messages, userMsg)
 	gen.send(map[string]any{"type": "user_message", "content": body.Message, "image_path": userMsg.ImagePath})
+	// Saved immediately so the user's own message is never lost to history
+	// even if what follows is cancelled or interrupted.
+	sess.AutoTitle()
+	a.sessions.Save(sess)
 
 	intent := router.ClassifyIntent(body.Message, hasAttachment)
 	complexity := router.ClassifyComplexity(body.Message)
@@ -99,7 +103,7 @@ func (a *App) runChatTurn(ctx context.Context, gen *Generation, sess *session.Se
 	if intent == router.IntentText || intent == router.IntentMixed {
 		text, handled := a.runTextTurn(ctx, gen, sess, hasAttachment, complexity)
 		if !handled {
-			gen.send(map[string]any{"type": "done"})
+			a.finishInterrupted(ctx, gen, sess)
 			return
 		}
 		assistantText = text
@@ -113,7 +117,7 @@ func (a *App) runChatTurn(ctx context.Context, gen *Generation, sess *session.Se
 		}
 		imgEvt, handled := a.runImageTurn(ctx, gen, sess, prompt)
 		if !handled {
-			gen.send(map[string]any{"type": "done"})
+			a.finishInterrupted(ctx, gen, sess)
 			return
 		}
 		imageEvent = imgEvt
@@ -141,6 +145,26 @@ func (a *App) runChatTurn(ctx context.Context, gen *Generation, sess *session.Se
 	gen.send(map[string]any{"type": "done"})
 }
 
+// finishInterrupted handles a turn that ended without a normal assistant
+// response. If it's because the user clicked Stop (ctx.Err() != nil), that's
+// recorded in history — so it's not just silently missing next time this
+// chat is opened — and the stream gets a distinct "cancelled" event rather
+// than "done" (which the UI treats as a full, successful completion).
+// Anything else that ends a turn early (no_model, engine_approval_needed, a
+// terminal generation error) already sent its own specific event before
+// returning here, so this just closes the stream with "done" as before.
+func (a *App) finishInterrupted(ctx context.Context, gen *Generation, sess *session.Session) {
+	if ctx.Err() != nil {
+		sess.Messages = append(sess.Messages, session.Message{
+			Role: session.RoleAssistant, Content: "(stopped)", Timestamp: time.Now(),
+		})
+		a.sessions.Save(sess)
+		gen.send(map[string]any{"type": "cancelled"})
+		return
+	}
+	gen.send(map[string]any{"type": "done"})
+}
+
 func displayModelName(m registry.Model) string {
 	if m.Name != "" {
 		return m.Name
@@ -158,6 +182,9 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 	tried := map[string]bool{}
 
 	for attempt := 0; attempt < 3; attempt++ {
+		if ctx.Err() != nil {
+			return "", false // stopped by the user — finishInterrupted handles reporting this
+		}
 		model, err := router.SelectTextModel(models, a.profile, complexity, needVision, tried)
 		if err != nil {
 			suggestion := catalog.BestFit(a.cat, registry.KindText, a.profile, a.reg.Snapshot())
@@ -182,6 +209,9 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 		}
 		log.Printf("text generation failed on model %s: %v", model.Filename, err)
 		tried[model.ID] = true
+	}
+	if ctx.Err() != nil {
+		return "", false // stopped by the user mid-retry — finishInterrupted handles reporting this
 	}
 	gen.send(map[string]any{"type": "error", "message": "Text generation failed on every installed model that fits this hardware. Try a smaller model or a shorter request."})
 	return "", false
@@ -352,7 +382,7 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 	deadline := time.Now().Add(imageTotalBudget)
 
 	for attempt := 0; attempt < 3; attempt++ {
-		if time.Until(deadline) < 30*time.Second {
+		if time.Until(deadline) < 30*time.Second || ctx.Err() != nil {
 			break
 		}
 		model, err := router.SelectImageModel(models, a.profile, tried)
@@ -385,6 +415,9 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 		}
 		log.Printf("image generation failed on model %s: %v", model.Filename, err)
 		tried[model.ID] = true
+	}
+	if ctx.Err() != nil {
+		return nil, false // stopped by the user mid-retry — finishInterrupted handles reporting this
 	}
 	gen.send(map[string]any{"type": "error", "message": "Image generation didn't finish within the 10-minute budget on this hardware, across every installed model that fits."})
 	return nil, false

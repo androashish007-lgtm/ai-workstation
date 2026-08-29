@@ -213,6 +213,7 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /api/sessions/{id}", a.handleDeleteSession)
 	mux.HandleFunc("PATCH /api/sessions/{id}", a.handlePatchSession)
 	mux.HandleFunc("GET /api/sessions/{id}/stream", a.handleSessionStream)
+	mux.HandleFunc("POST /api/sessions/{id}/stop", a.handleStopGeneration)
 	mux.HandleFunc("GET /api/projects", a.handleListProjects)
 	mux.HandleFunc("POST /api/projects", a.handleCreateProject)
 	mux.HandleFunc("PUT /api/projects/{id}", a.handleUpdateProject)

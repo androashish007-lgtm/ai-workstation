@@ -76,6 +76,16 @@ still working even though you're looking at something else; switch back any
 time and it'll be there, mid-response or finished. Which model answered is
 shown as a small label above its response.
 
+Every message shows the time it was sent or received underneath its bubble.
+
+## Stopping a response mid-generation
+
+While a chat is generating, the **Send** button turns into a red **Stop**
+button — click it to cancel immediately. Text generation stops after its
+current token; image generation kills the render outright. Whatever text
+had already streamed in stays on screen, marked *(stopped)*, and the chat
+is saved as-is so you can pick up from there with a follow-up message.
+
 ## Deleting chats
 
 Hover a chat in the sidebar for a **✕** to delete it (with confirmation).

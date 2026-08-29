@@ -8,6 +8,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -16,11 +17,16 @@ import (
 
 type genEvent map[string]any
 
+func isTerminalEvent(t any) bool {
+	return t == "done" || t == "error" || t == "cancelled"
+}
+
 // Generation is one in-flight response for one session. Every event it
 // produces is buffered (so a client that connects late, or reconnects,
 // gets caught up) and fanned out to any currently-attached subscribers.
 type Generation struct {
 	SessionID string
+	cancel    context.CancelFunc
 
 	mu     sync.Mutex
 	events []genEvent
@@ -28,14 +34,24 @@ type Generation struct {
 	done   bool
 }
 
-func newGeneration(sessionID string) *Generation {
-	return &Generation{SessionID: sessionID, subs: map[chan genEvent]bool{}}
+func newGeneration(sessionID string, cancel context.CancelFunc) *Generation {
+	return &Generation{SessionID: sessionID, cancel: cancel, subs: map[chan genEvent]bool{}}
+}
+
+// Stop cancels the context passed to whatever pipeline is generating this
+// response — text generation aborts its in-flight request to the (shared,
+// pooled) model process; image generation kills the sd-cli subprocess
+// outright via exec's context handling. Safe to call more than once.
+func (g *Generation) Stop() {
+	if g.cancel != nil {
+		g.cancel()
+	}
 }
 
 func (g *Generation) emit(evt genEvent) {
 	g.mu.Lock()
 	g.events = append(g.events, evt)
-	if evt["type"] == "done" || evt["type"] == "error" {
+	if isTerminalEvent(evt["type"]) {
 		g.done = true
 	}
 	for ch := range g.subs {
@@ -83,16 +99,20 @@ func NewGenerationManager() *GenerationManager {
 
 // Start registers a new Generation for sessionID, or returns ok=false if one
 // is already running there (callers should reject the new request rather
-// than clobber an in-progress response).
-func (m *GenerationManager) Start(sessionID string) (*Generation, bool) {
+// than clobber an in-progress response). The returned context is what the
+// generation pipeline must run under — cancelling it (via the Generation's
+// Stop method) is how a user-initiated stop actually propagates down into
+// the in-flight model request or subprocess.
+func (m *GenerationManager) Start(sessionID string) (*Generation, context.Context, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, busy := m.bySession[sessionID]; busy {
-		return nil, false
+		return nil, nil, false
 	}
-	g := newGeneration(sessionID)
+	ctx, cancel := context.WithCancel(context.Background())
+	g := newGeneration(sessionID, cancel)
 	m.bySession[sessionID] = g
-	return g, true
+	return g, ctx, true
 }
 
 func (m *GenerationManager) Get(sessionID string) (*Generation, bool) {
@@ -154,7 +174,7 @@ func (a *App) handleSessionStream(w http.ResponseWriter, r *http.Request) {
 	defer unsub()
 	for _, evt := range replay {
 		writeEvt(evt)
-		if evt["type"] == "done" || evt["type"] == "error" {
+		if isTerminalEvent(evt["type"]) {
 			return
 		}
 	}
@@ -169,9 +189,24 @@ func (a *App) handleSessionStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			writeEvt(evt)
-			if evt["type"] == "done" || evt["type"] == "error" {
+			if isTerminalEvent(evt["type"]) {
 				return
 			}
 		}
 	}
+}
+
+// handleStopGeneration cancels whatever's currently generating for this
+// session — text generation aborts its in-flight model request, image
+// generation kills the sd-cli subprocess. A no-op (404) if nothing's
+// running, e.g. the user clicked stop right as it finished on its own.
+func (a *App) handleStopGeneration(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	gen, active := a.generations.Get(id)
+	if !active {
+		http.Error(w, "nothing is currently generating for this chat", http.StatusNotFound)
+		return
+	}
+	gen.Stop()
+	w.WriteHeader(http.StatusAccepted)
 }

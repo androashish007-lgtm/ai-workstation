@@ -37,7 +37,7 @@
   // just this tab's live window into whichever session is currently shown;
   // switching sessions closes it and opens a new one for the newly-viewed
   // session, but never touches what's running server-side for any session.
-  let state = { sessions: [], projects: [], activeId: null, session: null, attachmentDataURI: null };
+  let state = { sessions: [], projects: [], activeId: null, session: null, attachmentDataURI: null, generating: false };
   let currentStream = null;
   let currentAssistantBubble = null;
   let editingProjectId = null; // null while the "New project" flow is open
@@ -324,6 +324,7 @@
     if (!id) return;
     if (currentStream) { currentStream.close(); currentStream = null; }
     currentAssistantBubble = null;
+    setComposerGenerating(false); // avoid a stale Stop label until this session's own stream reports in
 
     state.session = await api('/api/sessions/' + id);
     state.activeId = id;
@@ -332,6 +333,8 @@
     attachStream(id);
   }
 
+  const TERMINAL_EVENTS = new Set(['idle', 'done', 'cancelled', 'error']);
+
   function attachStream(id) {
     const es = new EventSource('/api/sessions/' + encodeURIComponent(id) + '/stream');
     currentStream = es;
@@ -339,14 +342,17 @@
       if (state.activeId !== id) return; // user switched away since this connected; ignore stale updates
       let evt;
       try { evt = JSON.parse(e.data); } catch { return; }
+      setComposerGenerating(!TERMINAL_EVENTS.has(evt.type));
       handleEvent(evt);
-      if (evt.type === 'idle' || evt.type === 'done' || evt.type === 'error') {
+      if (TERMINAL_EVENTS.has(evt.type)) {
+        setComposerGenerating(false);
         es.close();
         if (currentStream === es) currentStream = null;
         refreshSessionList();
       }
     };
     es.onerror = () => {
+      setComposerGenerating(false);
       es.close();
       if (currentStream === es) currentStream = null;
     };
@@ -355,14 +361,27 @@
   function renderMessages() {
     messagesEl.innerHTML = '';
     for (const m of (state.session.messages || [])) {
-      appendMessageEl(m.role, m.content, m.image_path ? '/images/' + m.image_path : null);
+      appendMessageEl(m.role, m.content, m.image_path ? '/images/' + m.image_path : null, m.timestamp);
     }
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
-  function appendMessageEl(role, text, imageUrl) {
+  function fmtTime(ts) {
+    const d = ts ? new Date(ts) : new Date();
+    if (isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  // timestamp is an ISO string when rendering saved history (the backend's
+  // own record of when it happened); live messages don't have one from the
+  // server yet, so the client's own clock at render time is used instead —
+  // close enough for a timestamp label, and gets replaced with the real
+  // saved value next time this session is loaded from disk.
+  function appendMessageEl(role, text, imageUrl, timestamp) {
     const wrap = document.createElement('div');
     wrap.className = 'msg ' + role;
+    const col = document.createElement('div');
+    col.className = 'msg-col';
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
     if (text) bubble.appendChild(document.createTextNode(text));
@@ -372,7 +391,12 @@
       img.src = imageUrl;
       bubble.appendChild(img);
     }
-    wrap.appendChild(bubble);
+    col.appendChild(bubble);
+    const timeEl = document.createElement('div');
+    timeEl.className = 'msg-time';
+    timeEl.textContent = fmtTime(timestamp);
+    col.appendChild(timeEl);
+    wrap.appendChild(col);
     messagesEl.appendChild(wrap);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return bubble;
@@ -589,9 +613,34 @@
   pollSystemUsage();
   setInterval(pollSystemUsage, 2000);
 
-  // --- Sending ---
+  // --- Sending / Stop ---
+  // The Send button doubles as Stop while a response is generating for the
+  // currently-viewed session — same button, its current action is whatever
+  // it currently says. That lets you interrupt a response, edit the draft
+  // you were typing underneath it, and send that instead without waiting.
+  function setComposerGenerating(isGenerating) {
+    state.generating = isGenerating;
+    sendBtn.textContent = isGenerating ? 'Stop' : 'Send';
+    sendBtn.classList.toggle('stop-mode', isGenerating);
+  }
+
+  async function stopGeneration() {
+    const id = state.activeId;
+    try {
+      await api('/api/sessions/' + id + '/stop', { method: 'POST' });
+    } catch (err) {
+      // Most likely it already finished on its own right as Stop was
+      // clicked — the terminal stream event will have already reset the
+      // button, so there's nothing more to do here.
+    }
+  }
+
   composer.addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (state.generating) {
+      stopGeneration();
+      return;
+    }
     const text = input.value.trim();
     if (!text) return;
 
@@ -607,7 +656,7 @@
     try {
       await api('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     } catch (err) {
-      appendMessageEl('assistant', 'Could not send: ' + err.message, null);
+      appendMessageEl('assistant', 'Could not send: ' + err.message, null, new Date().toISOString());
       return;
     }
     // The response streams in via this session's live event feed — attach
@@ -624,7 +673,7 @@
 
   function ensureAssistantBubble() {
     if (!currentAssistantBubble) {
-      currentAssistantBubble = appendMessageEl('assistant', '', null);
+      currentAssistantBubble = appendMessageEl('assistant', '', null, new Date().toISOString());
       currentAssistantBubble.classList.add('pending');
     }
     return currentAssistantBubble;
@@ -643,7 +692,7 @@
         const alreadyShown = last && last.classList.contains('user') &&
           last.querySelector('.bubble').textContent === evt.content;
         if (!alreadyShown) {
-          appendMessageEl('user', evt.content, evt.image_path ? '/images/' + evt.image_path : null);
+          appendMessageEl('user', evt.content, evt.image_path ? '/images/' + evt.image_path : null, new Date().toISOString());
         }
         break;
       }
@@ -703,6 +752,22 @@
         const bubble = ensureAssistantBubble();
         bubble.dataset.handled = '1';
         bubble.textContent = evt.message;
+        break;
+      }
+      case 'cancelled': {
+        // The backend saves a plain "(stopped)" to history on cancellation
+        // (no partial text) — mirrored here rather than left inconsistent
+        // with whatever partial text this live view happened to already
+        // show before Stop was clicked.
+        if (currentAssistantBubble) {
+          currentAssistantBubble.classList.remove('pending');
+          currentAssistantBubble.dataset.handled = '1';
+          const note = document.createElement('div');
+          note.className = 'caption';
+          note.textContent = '(stopped)';
+          currentAssistantBubble.appendChild(note);
+        }
+        currentAssistantBubble = null;
         break;
       }
       case 'done': {

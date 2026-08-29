@@ -206,8 +206,10 @@ body {
 
 .msg { display: flex; margin-bottom: 18px; }
 .msg.user { justify-content: flex-end; }
+.msg-col { display: flex; flex-direction: column; max-width: 75%; }
+.msg.user .msg-col { align-items: flex-end; }
+.msg.assistant .msg-col { align-items: flex-start; }
 .bubble {
-  max-width: 75%;
   padding: 10px 14px;
   border-radius: var(--radius);
   line-height: 1.5;
@@ -220,6 +222,7 @@ body {
 .bubble .caption { color: var(--text-dim); font-size: 12.5px; margin-top: 6px; font-style: italic; }
 .bubble.pending::after { content: "▍"; animation: blink 1s step-start infinite; }
 @keyframes blink { 50% { opacity: 0; } }
+.msg-time { font-size: 10.5px; color: var(--text-dim); margin-top: 3px; padding: 0 4px; }
 .model-tag {
   display: block;
   font-size: 11px;
@@ -305,6 +308,7 @@ body {
   font-size: 14px;
 }
 #sendBtn:disabled { opacity: .5; cursor: default; }
+#sendBtn.stop-mode { background: var(--danger); color: #fff; }
 
 .attach-preview { padding: 0 12% 8px; display: flex; align-items: center; gap: 8px; }
 .attach-preview img { height: 48px; border-radius: 6px; }
