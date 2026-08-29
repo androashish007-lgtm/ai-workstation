@@ -186,21 +186,67 @@ ARMv7). If you ever need to rebuild after editing `src/`, see
 
 ## Phase 2 (not built yet)
 
-Auto-generated chat titles/tags/summaries beyond simple truncation, PDF
-text extraction and OCR for scanned attachments, scheduled (rather than
-on-demand) re-suggestion of better-fit models as your hardware or the
-catalog changes, optional local-passphrase encryption of chat history,
-`update.sh`/`update.bat`/`update-termux.sh` maintenance scripts, an optional
-self-update check, and LLM-based (rather than keyword-based) text-vs-image
-intent detection.
+### Near-term / mechanical
 
-**Flux image model support**: the image engine invocation currently only
-passes a single checkpoint file (`-m <model>`), which is all SD1.5/SDXL
-single-file checkpoints need. Flux (dev/schnell) is a meaningfully higher
-quality option but needs 3 additional weight files loaded alongside the
-main diffusion model — a VAE, a CLIP-L text encoder, and a T5-XXL text
-encoder (itself several GB) — so this needs: extra CLI flags in
-`internal/engine/image.go`, a way for the registry to track/pair those
-companion files (similar to the existing vision-projector auto-pairing),
-and a catalog entry bundling all four files with a combined size that still
-fits a reasonable hardware budget.
+- Auto-generated chat titles/tags/summaries beyond simple truncation
+- PDF text extraction and OCR for scanned attachments
+- Scheduled (rather than on-demand) re-suggestion of better-fit models as
+  your hardware or the catalog changes
+- Optional local-passphrase encryption of chat history
+- `update.sh`/`update.bat`/`update-termux.sh` maintenance scripts
+- An optional self-update check
+- LLM-based (rather than keyword-based) text-vs-image intent detection
+- A toggle to let chat requests use live web search
+- A way to restrict a chat/project to a set of user-provided knowledge
+  documents (retrieval over your own files, not the whole model's training)
+
+### Model/generation quality
+
+- **Flux image model support**: the image engine invocation currently only
+  passes a single checkpoint file (`-m <model>`), which is all SD1.5/SDXL
+  single-file checkpoints need. Flux (dev/schnell) is a meaningfully higher
+  quality option but needs 3 additional weight files loaded alongside the
+  main diffusion model — a VAE, a CLIP-L text encoder, and a T5-XXL text
+  encoder (itself several GB) — so this needs: extra CLI flags in
+  `internal/engine/image.go`, a way for the registry to track/pair those
+  companion files (similar to the existing vision-projector auto-pairing),
+  and a catalog entry bundling all four files with a combined size that
+  still fits a reasonable hardware budget.
+- **Proactive GPU+CPU hybrid offload, self-calibrated per model.**
+  `llama.cpp` already runs GPU and CPU together when only some layers are
+  offloaded — the graduated `--n-gpu-layers` step-down ladder already
+  exercises that on retry, after a full-GPU attempt fails. What's missing
+  is doing this proactively instead of reactively: there's no reliable way
+  to ask Vulkan how much memory is actually free on this hardware (same
+  root problem as the earlier iGPU-VRAM-detection issue), so the practical
+  fix is the same self-calibration pattern already used for image
+  generation (`internal/imageperf`) — remember whatever `--n-gpu-layers`
+  value actually succeeded for a given model on this hardware, and start
+  there next time instead of guessing "everything" and crashing into it.
+  Parameter trimming (context/output length) should stay the last resort,
+  after GPU-offload adjustment, not before it.
+- Experimentally relax the 10-minute image generation budget (more
+  time/steps) and see whether real output quality actually improves
+  enough to justify it, rather than assuming it will.
+
+### Exploratory / research
+
+- Model/character creation from multiple reference images taken from
+  different angles
+- Model/character creation from video input, to capture expressions and
+  movement
+- Try running this project through the Fable model to see what it
+  surfaces that's worth acting on
+- Explore [OpenHuman](https://tinyhumans.gitbook.io/openhuman) (tinyhumans)
+  for architecture ideas worth adapting:
+  - [Memory Tree](https://tinyhumans.gitbook.io/openhuman/features/memory-tree)
+    + [Obsidian Wiki](https://tinyhumans.gitbook.io/openhuman/features/obsidian-wiki) —
+    data compressed into scored Markdown trees in local SQLite, mirrored as
+    an editable Obsidian vault instead of an opaque vector store
+  - [TokenJuice](https://tinyhumans.gitbook.io/openhuman/features/token-compression) —
+    compress tool output before it reaches the model (same information, up
+    to 80% fewer tokens), freeing up room to run larger models on the same
+    hardware budget
+  - [Split-brain orchestration](https://tinyhumans.gitbook.io/openhuman/features/orchestration) —
+    a fast reflex agent triages inbound requests while a deeper reasoning
+    core delegates to worker fleets
