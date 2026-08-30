@@ -14,6 +14,7 @@ import (
 	"aistation/internal/project"
 	"aistation/internal/registry"
 	"aistation/internal/safego"
+	"aistation/internal/selfupdate"
 	"aistation/internal/session"
 )
 
@@ -24,6 +25,15 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func (a *App) handleHW(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, a.profile)
+}
+
+// handleSelfUpdateCheck is the ONLY thing that triggers this app's check
+// for a newer version — a user clicking "Check for updates" — never on
+// its own initiative on startup or on a timer, matching the "no network
+// calls except ones you explicitly approve" promise the rest of the app
+// already keeps for model/engine downloads.
+func (a *App) handleSelfUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, selfupdate.Check())
 }
 
 type systemUsageResponse struct {

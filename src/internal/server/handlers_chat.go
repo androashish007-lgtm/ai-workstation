@@ -30,13 +30,28 @@ const imagePromptEnrichSystem = "You expand short user requests into a single de
 // response (across however many step-down retries it takes) — the request
 // context passed to the CLI is always capped so the last attempt can never
 // run past this regardless of how slow the hardware turns out to be.
-const imageTotalBudget = 10 * time.Minute
+//
+// Relaxed from 10 to 15 minutes after testing: on this hardware the old
+// 30-step ceiling (not the old 10-minute budget) was the actual binding
+// constraint for models that render fast, while a slow-per-step model
+// (large/high-res) was time-starved down to the 8-step floor well before
+// the old budget ran out — raising both this and imageMaxSteps together
+// let that case reach ~19 steps instead of 8, a real quality difference,
+// at roughly 11 vs 5 minutes. 20 minutes tested fine but wasn't judged
+// worth the extra wait over 15.
+const imageTotalBudget = 15 * time.Minute
 
 // imageFirstAttemptTarget: how much of the total budget the first (full
 // quality) attempt gets to aim for, via imageperf's measured steps-per-
 // second-at-this-resolution — leaving the rest as a safety margin for a
 // step-down retry if the hardware turns out slower than the last measurement.
-const imageFirstAttemptTarget = 7 * time.Minute
+const imageFirstAttemptTarget = 11 * time.Minute
+
+// imageMaxSteps caps sampling steps regardless of how much time budget is
+// available — for SD/SDXL-class models, quality gains past the
+// mid-40s/step range are marginal (diminishing returns), so this isn't
+// meant to be raised indefinitely just because the budget above was.
+const imageMaxSteps = 50
 
 type chatRequestBody struct {
 	SessionID          string   `json:"session_id"`
@@ -97,7 +112,7 @@ func (a *App) runChatTurn(ctx context.Context, gen *Generation, sess *session.Se
 	sess.AutoTitle()
 	a.sessions.Save(sess)
 
-	intent := router.ClassifyIntent(body.Message, hasAttachment)
+	intent := a.classifyIntent(body.Message, hasAttachment)
 	complexity := router.ClassifyComplexity(body.Message)
 
 	var assistantText string
@@ -140,6 +155,18 @@ func (a *App) runChatTurn(ctx context.Context, gen *Generation, sess *session.Se
 	sess.Messages = append(sess.Messages, assistantMsg)
 	sess.AutoTitle()
 	a.sessions.Save(sess)
+
+	// Replace the truncated first-message title with a real LLM-generated
+	// one, once, right after the first exchange — in the background, since
+	// it's a nice-to-have that must never delay the actual response the
+	// user is waiting on. Text-only for now: for an image-only turn the
+	// user's own prompt is usually already a decent title, and building an
+	// image-aware prompt for this is more complexity than the truncated
+	// fallback's shortcoming justifies.
+	if len(sess.Messages) == 2 && assistantText != "" {
+		userText := body.Message
+		safego.Go(func() { a.generateTitle(sess.ID, userText, assistantText) })
+	}
 
 	cfg := a.config.Load()
 	cfg.ActiveSessionID = sess.ID
@@ -191,6 +218,164 @@ func (a *App) persistNotice(sess *session.Session, text, notice string) {
 		Role: session.RoleAssistant, Content: text, Notice: notice, Timestamp: time.Now(),
 	})
 	a.sessions.Save(sess)
+}
+
+// generateTitle asks the smallest installed text model for a short title
+// summarizing the first exchange, replacing the truncated placeholder
+// AutoTitle set. Runs detached from the request that triggered it — reloads
+// the session fresh before writing so it doesn't clobber anything that
+// happened in the meantime, and simply gives up on any failure (an
+// unhelpful truncated title is a fine fallback; this is a nice-to-have,
+// not something worth retrying or reporting to the user).
+func (a *App) generateTitle(sessionID, userText, assistantText string) {
+	models := a.reg.ByKind(registry.KindText)
+	model, err := router.SelectTextModel(models, a.profile, router.ComplexitySimple, false, nil)
+	if err != nil {
+		return
+	}
+	binPath, status := a.ensureTextBinary(context.Background())
+	if status != engine.StatusReady {
+		return
+	}
+
+	prompt := "Reply with ONLY a short 3-6 word title for this chat — no quotes, no trailing punctuation, no preamble.\n\nUser: " +
+		truncateForTitle(userText, 300)
+	if assistantText != "" {
+		prompt += "\nAssistant: " + truncateForTitle(assistantText, 300)
+	}
+
+	params := router.InferTextParams(*model, a.profile, len(prompt), router.ComplexitySimple)
+	params.MaxTokens = 16 // a title needs a handful of tokens, not the usual reply budget
+
+	tp, release, _, err := a.textPool.Acquire(binPath, *model, params, "")
+	if err != nil {
+		return // most likely a load failure (see runTextTurn) — not worth retrying for a title
+	}
+	defer release()
+
+	stream, err := tp.ChatStream(context.Background(), []engine.ChatMessage{{Role: "user", Content: prompt}}, params.MaxTokens, 0.5)
+	if err != nil {
+		return
+	}
+	var out strings.Builder
+	for ev := range stream {
+		if ev.Err != nil {
+			return
+		}
+		out.WriteString(ev.Delta)
+		if ev.Done {
+			break
+		}
+	}
+	title := sanitizeTitle(out.String())
+	if title == "" {
+		return
+	}
+
+	fresh, err := a.sessions.Load(sessionID)
+	if err != nil {
+		return
+	}
+	fresh.Title = title
+	a.sessions.Save(fresh)
+}
+
+// classifyIntent asks the smallest installed text model whether this
+// request is text/image/mixed, falling back to router.ClassifyIntent's
+// keyword heuristic on any failure — a model that's slow to load, an
+// engine that isn't ready, a request that comes back ambiguous, or simply
+// no model being installed yet must never block the actual turn just to
+// decide how to route it. An attachment always skips straight to the
+// heuristic: "an image was attached" already unambiguously means at least
+// some vision analysis is needed, so there's nothing a classification
+// call would add.
+func (a *App) classifyIntent(text string, hasAttachment bool) router.Intent {
+	fallback := router.ClassifyIntent(text, hasAttachment)
+	if hasAttachment {
+		return fallback
+	}
+	models := a.reg.ByKind(registry.KindText)
+	model, err := router.SelectTextModel(models, a.profile, router.ComplexitySimple, false, nil)
+	if err != nil {
+		return fallback
+	}
+	// Only worth doing when this model is already warm: Acquire has no
+	// timeout of its own for a cold start (see TextPool.HasResident), so a
+	// classification call — meant to be a quick routing aid, not the
+	// response itself — must never be the thing that triggers (and then
+	// blocks on) loading a model from scratch. First message of a session
+	// gets the heuristic; every one after that, once something's resident,
+	// gets the real classification for free.
+	if !a.textPool.HasResident(model.ID, "") {
+		return fallback
+	}
+	binPath, status := a.ensureTextBinary(context.Background())
+	if status != engine.StatusReady {
+		return fallback
+	}
+
+	prompt := "Classify the request below as exactly one word — TEXT (a question, conversation, or writing request), " +
+		"IMAGE (asking to create/draw/generate/paint a picture), or MIXED (asking to both discuss or describe something " +
+		"AND create an image). Respond with ONLY that one word, nothing else.\n\nRequest: " + truncateForTitle(text, 500)
+
+	params := router.InferTextParams(*model, a.profile, len(prompt), router.ComplexitySimple)
+	params.MaxTokens = 4 // one classification word
+
+	tp, release, _, err := a.textPool.Acquire(binPath, *model, params, "")
+	if err != nil {
+		return fallback
+	}
+	defer release()
+
+	// Short, hard timeout: this is a routing aid, not the response itself
+	// — a classification call that's still running after a few seconds is
+	// not worth waiting on when the cheap heuristic is right there.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := tp.ChatStream(ctx, []engine.ChatMessage{{Role: "user", Content: prompt}}, params.MaxTokens, 0)
+	if err != nil {
+		return fallback
+	}
+	var out strings.Builder
+	for ev := range stream {
+		if ev.Err != nil {
+			return fallback
+		}
+		out.WriteString(ev.Delta)
+		if ev.Done {
+			break
+		}
+	}
+	switch strings.ToUpper(strings.TrimSpace(out.String())) {
+	case "IMAGE":
+		return router.IntentImage
+	case "MIXED":
+		return router.IntentMixed
+	case "TEXT":
+		return router.IntentText
+	default:
+		return fallback // didn't answer cleanly — don't trust a guess over the heuristic
+	}
+}
+
+func truncateForTitle(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// sanitizeTitle strips the quoting/trailing-punctuation a small model
+// commonly wraps a short answer in, and caps length defensively in case it
+// ignores the "3-6 words" instruction.
+func sanitizeTitle(s string) string {
+	t := strings.TrimSpace(s)
+	t = strings.Trim(t, "\"'“”‘’")
+	t = strings.TrimRight(t, ".!? \t\n")
+	if len(t) > 60 {
+		t = strings.TrimSpace(t[:60])
+	}
+	return t
 }
 
 func displayModelName(m registry.Model) string {
@@ -553,7 +738,7 @@ func (a *App) generateImage(ctx context.Context, opID string, binPath string, mo
 		if attempt > 0 || targetSeconds > remaining.Seconds()-5 {
 			targetSeconds = remaining.Seconds() - 5
 		}
-		params.Steps = a.imagePerf.StepsForBudget(params.Width, params.Height, targetSeconds, 8, 30)
+		params.Steps = a.imagePerf.StepsForBudget(params.Width, params.Height, targetSeconds, 8, imageMaxSteps)
 
 		// Cap this attempt's own timeout to its target budget (with slack
 		// for the estimate being off), not the full remaining time — a bad

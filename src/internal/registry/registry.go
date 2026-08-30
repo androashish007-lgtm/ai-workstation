@@ -186,6 +186,26 @@ func (r *Registry) registerIfChanged(absPath string, isText bool) {
 	if ok && existing.SizeBytes == info.Size() {
 		return // cheap heuristic: same size, assume unchanged, skip re-hashing multi-GB files
 	}
+
+	// The same file may already be registered under a different absolute
+	// path — this whole portable folder is designed to be moved between
+	// drive letters/mount points (a USB stick moved from one computer's
+	// D: to another's E:, an SD card reformatted and copied back), and a
+	// changed prefix alone would otherwise look like "every model file is
+	// new" and force re-hashing potentially tens of GB purely because the
+	// path string changed, not the bytes. Filename+exact size is a cheap,
+	// no-re-read signal that it's the same file relocated.
+	if reused, ok := r.reuseByFilenameAndSize(filepath.Base(absPath), info.Size()); ok {
+		reused.Path = absPath
+		reused.DetectedAt = time.Now()
+		r.mu.Lock()
+		r.models[absPath] = reused
+		r.mu.Unlock()
+		r.save()
+		r.notify()
+		return
+	}
+
 	m, err := fingerprintAndClassify(absPath, isText)
 	if err != nil {
 		log.Printf("registry: failed to register %s: %v", absPath, err)
@@ -196,6 +216,21 @@ func (r *Registry) registerIfChanged(absPath string, isText bool) {
 	r.mu.Unlock()
 	r.save()
 	r.notify()
+}
+
+// reuseByFilenameAndSize looks for an already-registered model matching by
+// filename and exact byte size, regardless of its stored absolute path —
+// see registerIfChanged for why this specific pair is trusted as "same
+// file" without re-reading it.
+func (r *Registry) reuseByFilenameAndSize(filename string, size int64) (Model, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, m := range r.models {
+		if m.Filename == filename && m.SizeBytes == size {
+			return m, true
+		}
+	}
+	return Model{}, false
 }
 
 func fingerprintAndClassify(absPath string, isText bool) (Model, error) {

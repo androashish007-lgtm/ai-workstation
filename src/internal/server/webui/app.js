@@ -11,6 +11,8 @@
   const newChatBtn = document.getElementById('newChatBtn');
   const newProjectBtn = document.getElementById('newProjectBtn');
   const deleteAllBtn = document.getElementById('deleteAllBtn');
+  const updateCheckBtn = document.getElementById('updateCheckBtn');
+  const updateStatus = document.getElementById('updateStatus');
   const projectModal = document.getElementById('projectModal');
   const projectModalTitle = document.getElementById('projectModalTitle');
   const projectNameInput = document.getElementById('projectNameInput');
@@ -76,6 +78,26 @@
     renderSessionList();
     await openSession(state.activeId);
     renderSuggestions(data.suggestions_text, data.suggestions_image, data.models);
+
+    // Suggestions were previously only (re-)computed at page load or when
+    // a chat request actually failed for lack of a model — so installing
+    // a model (or the hardware/catalog otherwise changing) while this tab
+    // stays open indefinitely was never reflected until a reload. Re-check
+    // periodically instead of only on those two triggers.
+    setInterval(refreshSuggestions, 30 * 60 * 1000);
+  }
+
+  async function refreshSuggestions() {
+    try {
+      const [models, textSug, imageSug] = await Promise.all([
+        api('/api/registry'),
+        api('/api/suggestions?kind=text'),
+        api('/api/suggestions?kind=image'),
+      ]);
+      renderSuggestions(textSug, imageSug, models);
+    } catch {
+      // Best-effort background refresh — leave whatever's currently shown.
+    }
   }
 
   function renderSessionList() {
@@ -363,6 +385,12 @@
         es.close();
         if (currentStream === es) currentStream = null;
         refreshSessionList();
+        // The backend replaces a new chat's truncated placeholder title
+        // with an LLM-generated one in the background after the first
+        // exchange, with no live event of its own — so a fixed delay
+        // after "done" is the only way this view picks it up promptly
+        // instead of waiting for some unrelated later refresh.
+        if (evt.type === 'done') setTimeout(refreshSessionList, 4000);
       }
     };
     es.onerror = () => {
@@ -412,6 +440,19 @@
     const d = ts ? new Date(ts) : new Date();
     if (isNaN(d.getTime())) return '';
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  }
+
+  // A streaming assistant bubble is stamped with "now" the moment it's
+  // first created (ensureAssistantBubble), which is when the response
+  // STARTED, not when it finished — for anything but an instant reply
+  // that's the wrong time to show. Call this once the response actually
+  // completes so the displayed time matches what gets saved to history
+  // (the backend timestamps the message after generation finishes, not
+  // before), instead of the two silently disagreeing until the next reload.
+  function refreshMessageTime(bubble) {
+    if (!bubble || !bubble.parentElement) return;
+    const timeEl = bubble.parentElement.querySelector('.msg-time');
+    if (timeEl) timeEl.textContent = fmtTime(new Date().toISOString());
   }
 
   // timestamp is an ISO string when rendering saved history (the backend's
@@ -662,6 +703,27 @@
       qrUrl.textContent = 'No LAN address available (the app may be running with LAN access disabled).';
     }
   };
+  updateCheckBtn.onclick = async () => {
+    updateStatus.hidden = false;
+    updateStatus.textContent = 'Checking…';
+    updateCheckBtn.disabled = true;
+    try {
+      const st = await api('/api/self-update/check');
+      if (st.error) {
+        updateStatus.textContent = 'Could not check: ' + st.error;
+      } else if (st.update_available) {
+        updateStatus.innerHTML = `Update available: v${st.current} → v${st.latest}. ` +
+          `Run the update script, or see <a href="${st.repo_url}" target="_blank" rel="noopener">${st.repo_url}</a>.`;
+      } else {
+        updateStatus.textContent = `Up to date (v${st.current}).`;
+      }
+    } catch (e) {
+      updateStatus.textContent = 'Could not check: ' + e.message;
+    } finally {
+      updateCheckBtn.disabled = false;
+    }
+  };
+
   qrClose.onclick = closeQR;
   qrModal.onclick = (e) => { if (e.target === qrModal) closeQR(); };
   document.addEventListener('keydown', (e) => {
@@ -876,6 +938,7 @@
           note.className = 'caption';
           note.textContent = '(stopped)';
           currentAssistantBubble.appendChild(note);
+          refreshMessageTime(currentAssistantBubble);
         }
         currentAssistantBubble = null;
         break;
@@ -885,6 +948,8 @@
           currentAssistantBubble.classList.remove('pending');
           if (!currentAssistantBubble.textContent && !currentAssistantBubble.querySelector('img')) {
             currentAssistantBubble.parentElement.remove();
+          } else {
+            refreshMessageTime(currentAssistantBubble);
           }
         }
         currentAssistantBubble = null;

@@ -62,6 +62,22 @@ func maxConcurrentModels(p hw.Profile) int {
 
 func poolKey(modelID, mmproj string) string { return modelID + "|" + mmproj }
 
+// HasResident reports whether this model is already loaded and running —
+// for callers deciding whether an extra ancillary use (e.g. a quick
+// classification aside) is basically free (an already-warm process, no
+// wait) versus would trigger a full cold start. Acquire has no timeout of
+// its own (StartTextServer's health-check wait runs up to 90s while
+// holding the pool's lock), which is fine for the one real reply a request
+// is actually waiting on, but wrong for something that's supposed to be a
+// cheap routing aid — callers doing the latter should check this first and
+// skip rather than risk that same wait.
+func (p *TextPool) HasResident(modelID, mmproj string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.entries[poolKey(modelID, mmproj)]
+	return ok
+}
+
 // Acquire returns a running TextProcess for this model, starting one if
 // needed (evicting the least-recently-used idle process if the pool is at
 // capacity). The returned release func must be called when the caller is
