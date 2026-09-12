@@ -22,3 +22,7 @@ src/*.test
 Thumbs.db
 *.log
 .claude/
+
+# Local working notes — not meant for the public repo
+FABLE-REVIEW.md
+REVIEW-Fable.md

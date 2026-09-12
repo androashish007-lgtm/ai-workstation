@@ -20,26 +20,36 @@
   const projectSaveBtn = document.getElementById('projectSaveBtn');
   const projectCancelBtn = document.getElementById('projectCancelBtn');
   const projectDeleteBtn = document.getElementById('projectDeleteBtn');
-  const qrBtn = document.getElementById('qrBtn');
-  const qrModal = document.getElementById('qrModal');
   const qrImg = document.getElementById('qrImg');
   const qrUrl = document.getElementById('qrUrl');
-  const qrClose = document.getElementById('qrClose');
+  const modelDirsError = document.getElementById('modelDirsError');
+  const textDirsDefault = document.getElementById('textDirsDefault');
+  const textDirsList = document.getElementById('textDirsList');
+  const textDirInput = document.getElementById('textDirInput');
+  const textDirAddBtn = document.getElementById('textDirAddBtn');
+  const imageDirsDefault = document.getElementById('imageDirsDefault');
+  const imageDirsList = document.getElementById('imageDirsList');
+  const imageDirInput = document.getElementById('imageDirInput');
+  const imageDirAddBtn = document.getElementById('imageDirAddBtn');
   const statusDot = document.getElementById('statusDot');
   const statusText = document.getElementById('statusText');
   const statusBadge = document.getElementById('statusBadge');
-  const tabChat = document.getElementById('tabChat');
-  const tabUsage = document.getElementById('tabUsage');
-  const chatPanel = document.getElementById('chatPanel');
-  const usagePanel = document.getElementById('usagePanel');
+  const activeModelsBadge = document.getElementById('activeModelsBadge');
+  const activeModelsText = document.getElementById('activeModelsText');
   const usageTable = document.getElementById('usageTable');
+  const settingsBtn = document.getElementById('settingsBtn');
+  const settingsModal = document.getElementById('settingsModal');
+  const settingsCloseBtn = document.getElementById('settingsCloseBtn');
+  const logsView = document.getElementById('logsView');
+  const textModelSelect = document.getElementById('textModelSelect');
+  const imageModelSelect = document.getElementById('imageModelSelect');
 
   // Sessions generate independently of whichever one is being viewed — the
   // backend keeps working regardless of what's on screen. currentStream is
   // just this tab's live window into whichever session is currently shown;
   // switching sessions closes it and opens a new one for the newly-viewed
   // session, but never touches what's running server-side for any session.
-  let state = { sessions: [], projects: [], activeId: null, session: null, attachments: [], generating: false };
+  let state = { sessions: [], projects: [], models: [], activeId: null, session: null, attachments: [], generating: false };
   let currentStream = null;
   let currentAssistantBubble = null;
   let editingProjectId = null; // null while the "New project" flow is open
@@ -72,12 +82,14 @@
     const data = await api('/api/bootstrap');
     state.sessions = data.sessions || [];
     state.projects = data.projects || [];
+    state.models = data.models || [];
     state.activeId = data.active_session_id;
     hwLineEl.textContent = `${data.hw.cpu_cores} cores · ${fmtBytes(data.hw.total_ram_bytes)} RAM` +
       (data.hw.gpu_vendor && data.hw.gpu_vendor !== 'none' ? ` · ${data.hw.gpu_vendor} GPU` : ' · CPU only');
     renderSessionList();
     await openSession(state.activeId);
     renderSuggestions(data.suggestions_text, data.suggestions_image, data.models);
+    renderModelPickers();
 
     // Suggestions were previously only (re-)computed at page load or when
     // a chat request actually failed for lack of a model — so installing
@@ -94,11 +106,87 @@
         api('/api/suggestions?kind=text'),
         api('/api/suggestions?kind=image'),
       ]);
+      state.models = models || [];
       renderSuggestions(textSug, imageSug, models);
+      renderModelPickers();
     } catch {
       // Best-effort background refresh — leave whatever's currently shown.
     }
   }
+
+  // renderModelPickers fills the two composer dropdowns from whatever's
+  // currently installed, always with "Auto" first (the router's normal
+  // hardware/complexity-fit pick — see router.SelectTextModel/
+  // SelectImageModel) so nothing changes for anyone who never touches
+  // them. Re-run on every session switch/model-list refresh so a model
+  // deleted (or added) elsewhere doesn't leave a stale/missing option
+  // selected.
+  function renderModelPickers() {
+    const textModels = state.models.filter(m => m.kind === 'text' && !m.is_vision_projector);
+    // image_role marks a FLUX.2 VAE/text-encoder file — a component paired
+    // onto a diffusion-model checkpoint (see fillModelSelect's incomplete-
+    // FLUX.2 handling below), never itself something to generate with.
+    const imageModels = state.models.filter(m => m.kind === 'image' && !m.image_role);
+    const selectedText = (state.session && state.session.last_text_model_id) || '';
+    const selectedImage = (state.session && state.session.last_image_model_id) || '';
+    fillModelSelect(textModelSelect, textModels, selectedText);
+    fillModelSelect(imageModelSelect, imageModels, selectedImage);
+    textModelSelect.disabled = textModels.length === 0;
+    imageModelSelect.disabled = imageModels.length === 0;
+  }
+
+  // Mirrors router.LooksLikeEditingModel (Go) — these checkpoints expect an
+  // existing photo plus an edit instruction (img2img/inpaint/pix2pix-style),
+  // not a from-scratch text prompt, and produce garbled/blurry/duplicated
+  // output when picked for one. The Model Usage tab already explains this,
+  // but that's a separate panel from the picker where the choice actually
+  // gets made — surfaced here too so picking one isn't a silent trap.
+  const EDITING_MODEL_HINTS = ['pix2pix', 'inpaint', 'controlnet', 'img2img'];
+  function looksLikeEditingModel(filename) {
+    const f = (filename || '').toLowerCase();
+    return EDITING_MODEL_HINTS.some(h => f.includes(h));
+  }
+
+  function fillModelSelect(select, models, selectedId) {
+    select.innerHTML = '';
+    const auto = document.createElement('option');
+    auto.value = '';
+    auto.textContent = 'Auto (recommended)';
+    select.appendChild(auto);
+    for (const m of models) {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = (m.name || m.filename) + ' — ' + fmtBytes(m.size_bytes);
+      // A FLUX.2 checkpoint needs a separate VAE and text-encoder file
+      // installed alongside it (see registry.Model.PairedVAE/
+      // PairedTextEncoder) — surfaced here rather than just failing
+      // silently if picked, since there's no other place a user would
+      // see this.
+      if (m.image_family === 'flux2' && (!m.paired_vae || !m.paired_text_encoder)) {
+        const missing = [!m.paired_vae && 'VAE', !m.paired_text_encoder && 'text encoder'].filter(Boolean).join(' + ');
+        opt.textContent += ` (missing ${missing})`;
+        opt.disabled = true;
+      }
+      if (looksLikeEditingModel(m.filename)) {
+        opt.textContent += ' (needs a reference image — not for text-to-image)';
+      }
+      select.appendChild(opt);
+    }
+    // Fall back to Auto if the previously-picked model was deleted since.
+    select.value = models.some(m => m.id === selectedId) ? selectedId : '';
+  }
+
+  async function setSelectedModel(kind, modelId) {
+    if (!state.activeId) return;
+    const body = kind === 'text' ? { text_model_id: modelId } : { image_model_id: modelId };
+    const updated = await api('/api/sessions/' + state.activeId, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (state.session && state.session.id === updated.id) state.session = updated;
+  }
+
+  textModelSelect.addEventListener('change', () => setSelectedModel('text', textModelSelect.value));
+  imageModelSelect.addEventListener('change', () => setSelectedModel('image', imageModelSelect.value));
 
   function renderSessionList() {
     sessionListEl.innerHTML = '';
@@ -354,6 +442,7 @@
     state.activeId = id;
     renderSessionList();
     renderMessages();
+    renderModelPickers();
     attachStream(id);
   }
 
@@ -488,7 +577,7 @@
   function renderSuggestions(textSug, imageSug, models) {
     suggestionArea.innerHTML = '';
     const hasText = (models || []).some(m => m.kind === 'text' && !m.is_vision_projector);
-    const hasImage = (models || []).some(m => m.kind === 'image');
+    const hasImage = (models || []).some(m => m.kind === 'image' && !m.image_role);
     if (!hasText && textSug && textSug.length) suggestionArea.appendChild(suggestionCard(textSug[0], 'No chat model installed yet'));
     if (!hasImage && imageSug && imageSug.length) suggestionArea.appendChild(suggestionCard(imageSug[0], 'No image model installed yet'));
   }
@@ -601,18 +690,6 @@
     await openSession(s.id);
   };
 
-  // --- Tabs ---
-  function showTab(which) {
-    const chat = which === 'chat';
-    chatPanel.hidden = !chat;
-    usagePanel.hidden = chat;
-    tabChat.classList.toggle('active', chat);
-    tabUsage.classList.toggle('active', !chat);
-    if (!chat) loadModelUsage();
-  }
-  tabChat.onclick = () => showTab('chat');
-  tabUsage.onclick = () => showTab('usage');
-
   async function loadModelUsage() {
     usageTable.innerHTML = '<div class="usage-empty">Loading…</div>';
     let groups;
@@ -685,24 +762,99 @@
     return d.innerHTML;
   }
 
-  // --- QR / phone access ---
-  function closeQR() { qrModal.hidden = true; }
-  qrBtn.onclick = async () => {
+  // --- Settings modal (Model usage / Model folders / Phone access / Updates / Data) ---
+  // One modal, opened by a single sidebar button, with its own sub-tabs —
+  // consolidates what used to be five separate sidebar buttons/tabs into
+  // one place, each section loading its data lazily the first time it's
+  // switched to rather than all up front.
+  const settingsSections = {
+    usage: { tab: document.getElementById('settingsTabUsage'), panel: document.getElementById('settingsUsageSection'), load: loadModelUsage },
+    dirs: { tab: document.getElementById('settingsTabDirs'), panel: document.getElementById('settingsDirsSection'), load: loadModelDirs },
+    phone: { tab: document.getElementById('settingsTabPhone'), panel: document.getElementById('settingsPhoneSection'), load: loadQR },
+    updates: { tab: document.getElementById('settingsTabUpdates'), panel: document.getElementById('settingsUpdatesSection') },
+    logs: { tab: document.getElementById('settingsTabLogs'), panel: document.getElementById('settingsLogsSection'), load: loadLogs },
+    data: { tab: document.getElementById('settingsTabData'), panel: document.getElementById('settingsDataSection') },
+  };
+
+  function showSettingsSection(name) {
+    if (name !== 'logs') stopLogsPoll(); // only the Logs tab needs to keep polling while open
+    for (const [key, s] of Object.entries(settingsSections)) {
+      const active = key === name;
+      s.tab.classList.toggle('active', active);
+      s.panel.hidden = !active;
+    }
+    settingsSections[name].load?.();
+  }
+  for (const [key, s] of Object.entries(settingsSections)) {
+    s.tab.onclick = () => showSettingsSection(key);
+  }
+
+  function openSettings() { settingsModal.hidden = false; showSettingsSection('usage'); }
+  function closeSettings() { settingsModal.hidden = true; stopLogsPoll(); }
+  settingsBtn.onclick = openSettings;
+  settingsCloseBtn.onclick = closeSettings;
+  settingsModal.onclick = (e) => { if (e.target === settingsModal) closeSettings(); };
+
+  // --- Live log tail ---
+  let logsCursor = 0;
+  let logsPollTimer = null;
+
+  function appendLogLines(lines) {
+    if (!lines || !lines.length) return;
+    // Only auto-scroll if the view was already at (or near) the bottom —
+    // preserves a manual scroll-up to read older lines instead of yanking
+    // the viewport back down on every new poll.
+    const atBottom = logsView.scrollTop + logsView.clientHeight >= logsView.scrollHeight - 4;
+    for (const line of lines) {
+      logsView.appendChild(document.createTextNode(line + '\n'));
+    }
+    if (atBottom) logsView.scrollTop = logsView.scrollHeight;
+  }
+
+  async function loadLogs() {
+    logsView.textContent = '';
+    logsCursor = 0;
+    try {
+      const data = await api('/api/logs');
+      appendLogLines(data.lines);
+      logsCursor = data.cursor || 0;
+    } catch (e) {
+      logsView.textContent = 'Could not load logs: ' + e.message;
+    }
+    stopLogsPoll();
+    logsPollTimer = setInterval(pollLogs, 1500);
+  }
+
+  async function pollLogs() {
+    try {
+      const data = await api('/api/logs?since=' + logsCursor);
+      appendLogLines(data.lines);
+      logsCursor = data.cursor || logsCursor;
+    } catch (e) {
+      // Transient — the modal may have closed mid-request; next tick retries.
+    }
+  }
+
+  function stopLogsPoll() {
+    if (logsPollTimer) { clearInterval(logsPollTimer); logsPollTimer = null; }
+  }
+
+  async function loadQR() {
     qrUrl.textContent = 'Loading…';
     qrImg.removeAttribute('src');
-    qrModal.hidden = false;
     try {
       // Always the machine's real LAN IP, never window.location.origin —
       // that's 127.0.0.1 whenever the desktop app opened this locally,
       // which is meaningless to a phone.
       const { url } = await api('/api/lan-url');
       qrImg.onload = () => { qrUrl.textContent = url; };
-      qrImg.onerror = () => { qrUrl.textContent = 'Could not load the QR code — the app may have restarted. Close this and try again.'; };
+      qrImg.onerror = () => { qrUrl.textContent = 'Could not load the QR code — the app may have restarted. Try again.'; };
       qrImg.src = '/api/qr?url=' + encodeURIComponent(url);
     } catch (e) {
       qrUrl.textContent = 'No LAN address available (the app may be running with LAN access disabled).';
     }
-  };
+  }
+
   updateCheckBtn.onclick = async () => {
     updateStatus.hidden = false;
     updateStatus.textContent = 'Checking…';
@@ -724,13 +876,74 @@
     }
   };
 
-  qrClose.onclick = closeQR;
-  qrModal.onclick = (e) => { if (e.target === qrModal) closeQR(); };
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape') return;
-    if (!qrModal.hidden) closeQR();
+    if (!settingsModal.hidden) closeSettings();
     if (!projectModal.hidden) closeProjectModal();
   });
+
+  // --- Model folders (extra scan locations) ---
+  function renderDirsList(listEl, dirs, kind) {
+    listEl.innerHTML = '';
+    for (const d of dirs) {
+      const row = document.createElement('div');
+      row.className = 'model-dirs-item';
+      row.innerHTML = `<span>${escapeHtml(d)}</span><button title="Remove">✕</button>`;
+      row.querySelector('button').onclick = () => removeModelDir(kind, d);
+      listEl.appendChild(row);
+    }
+  }
+
+  let modelDirsCache = { text: { default: '', extra: [] }, image: { default: '', extra: [] } };
+
+  async function loadModelDirs() {
+    modelDirsError.hidden = true;
+    try {
+      modelDirsCache = await api('/api/model-dirs');
+      textDirsDefault.textContent = modelDirsCache.text.default;
+      imageDirsDefault.textContent = modelDirsCache.image.default;
+      renderDirsList(textDirsList, modelDirsCache.text.extra || [], 'text');
+      renderDirsList(imageDirsList, modelDirsCache.image.extra || [], 'image');
+    } catch (e) {
+      modelDirsError.hidden = false;
+      modelDirsError.textContent = 'Could not load: ' + e.message;
+    }
+  }
+
+  async function saveModelDirs(kind, dirs) {
+    modelDirsError.hidden = true;
+    try {
+      await api('/api/model-dirs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ kind, dirs }),
+      });
+      await loadModelDirs();
+      await refreshSuggestions(); // the newly (un)scanned folder's models should show up/disappear right away
+    } catch (e) {
+      modelDirsError.hidden = false;
+      modelDirsError.textContent = e.message;
+    }
+  }
+
+  function addModelDir(kind) {
+    const input = kind === 'text' ? textDirInput : imageDirInput;
+    const path = input.value.trim();
+    if (!path) return;
+    const current = modelDirsCache[kind].extra || [];
+    if (current.includes(path)) { input.value = ''; return; }
+    saveModelDirs(kind, [...current, path]);
+    input.value = '';
+  }
+
+  function removeModelDir(kind, path) {
+    const current = modelDirsCache[kind].extra || [];
+    saveModelDirs(kind, current.filter(d => d !== path));
+  }
+
+  textDirAddBtn.onclick = () => addModelDir('text');
+  imageDirAddBtn.onclick = () => addModelDir('image');
+  textDirInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addModelDir('text'); } });
+  imageDirInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); addModelDir('image'); } });
 
   // --- System usage badge ---
   const ACTIVITY_LABELS = {
@@ -773,6 +986,38 @@
   }
   pollSystemUsage();
   setInterval(pollSystemUsage, 2000);
+
+  // --- Active models widget ---
+  // Shows which specific text/image model is actually loaded or generating
+  // right now, next to the CPU/RAM badge above — a plain "45% CPU" reading
+  // doesn't say which of several installed models is responsible for it.
+  function describeModelSide(entries, icon) {
+    if (!entries || !entries.length) return '';
+    const e = entries[0];
+    let text = icon + ' ' + e.name;
+    if (e.busy) text += ' (generating)';
+    else if (e.loaded) text += ' (loaded)';
+    else text += ' (last used)';
+    if (entries.length > 1) text += ` +${entries.length - 1} more`;
+    return text;
+  }
+
+  async function pollActiveModels() {
+    try {
+      const data = await api('/api/usage/active-models');
+      const parts = [describeModelSide(data.text, '💬'), describeModelSide(data.image, '🖼')].filter(Boolean);
+      if (!parts.length) {
+        activeModelsBadge.hidden = true;
+        return;
+      }
+      activeModelsText.textContent = parts.join(' · ');
+      activeModelsBadge.hidden = false;
+    } catch (e) {
+      // Cosmetic feature: fail silent, keep showing the last good reading.
+    }
+  }
+  pollActiveModels();
+  setInterval(pollActiveModels, 2000);
 
   // --- Sending / Stop ---
   // The Send button doubles as Stop while a response is generating for the
@@ -869,12 +1114,31 @@
         break;
       }
       case 'model': {
+        // Always reflects the latest attempt, not just the first — a turn
+        // that falls back to a different model after the first one failed
+        // (see 'model_fallback' below) fires this again with the model
+        // that's actually generating now, and the tag should track that.
         const bubble = ensureAssistantBubble();
-        if (!bubble.querySelector('.model-tag')) {
-          const tag = document.createElement('span');
+        let tag = bubble.querySelector('.model-tag');
+        if (!tag) {
+          tag = document.createElement('span');
           tag.className = 'model-tag';
-          tag.textContent = evt.name;
           bubble.insertBefore(tag, bubble.firstChild);
+        }
+        tag.textContent = evt.name;
+        break;
+      }
+      case 'model_fallback': {
+        // The explicitly-selected model (dropdown pick, not Auto) failed to
+        // load/generate and a different installed model answered instead —
+        // shown so this never looks like the selection was silently
+        // ignored (see handlers_chat.go's runTextTurn/runImageTurn).
+        const bubble = ensureAssistantBubble();
+        if (!bubble.querySelector('.fallback-note')) {
+          const note = document.createElement('div');
+          note.className = 'fallback-note';
+          note.textContent = `⚠ ${evt.requested} didn't respond — answered with ${evt.used} instead.`;
+          bubble.insertBefore(note, bubble.firstChild);
         }
         break;
       }

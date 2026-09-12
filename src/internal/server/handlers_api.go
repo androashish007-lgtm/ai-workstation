@@ -311,7 +311,7 @@ func (a *App) handleDownloadModel(w http.ResponseWriter, r *http.Request) {
 	}
 
 	safego.Go(func() {
-		opID, end := a.activity.Begin(ActivityDownloadingModel)
+		opID, end := a.activity.Begin(ActivityDownloadingModel, entry.Name)
 		defer end()
 		if err := a.fetchCatalogEntry(opID, *entry); err != nil {
 			a.dlMu.Lock()
@@ -497,12 +497,18 @@ func (a *App) clearActiveIfDeleted(id string) {
 	}
 }
 
-// handlePatchSession currently supports moving a chat into/out of a
-// project ({"project_id": "..."} or {"project_id": ""} to ungroup).
+// handlePatchSession supports moving a chat into/out of a project
+// ({"project_id": "..."} or {"project_id": ""} to ungroup) and setting this
+// chat's explicit model override ({"text_model_id": "..."} /
+// {"image_model_id": "..."}, "" to reset to Auto) — the model dropdown next
+// to the composer calls this on every change so the pick sticks for the
+// rest of the chat and survives a reload.
 func (a *App) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var body struct {
-		ProjectID *string `json:"project_id"`
+		ProjectID    *string `json:"project_id"`
+		TextModelID  *string `json:"text_model_id"`
+		ImageModelID *string `json:"image_model_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -521,6 +527,20 @@ func (a *App) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.ProjectID = *body.ProjectID
+	}
+	if body.TextModelID != nil {
+		if *body.TextModelID != "" && !a.reg.Has(registry.KindText, *body.TextModelID) {
+			http.Error(w, "unknown text model id", http.StatusNotFound)
+			return
+		}
+		s.LastTextID = *body.TextModelID
+	}
+	if body.ImageModelID != nil {
+		if *body.ImageModelID != "" && !a.reg.Has(registry.KindImage, *body.ImageModelID) {
+			http.Error(w, "unknown image model id", http.StatusNotFound)
+			return
+		}
+		s.LastImageID = *body.ImageModelID
 	}
 	if err := a.sessions.Save(s); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -615,4 +635,3 @@ func (a *App) handleLANURL(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, map[string]any{"url": url})
 }
-

@@ -85,7 +85,17 @@ func ClassifyComplexity(text string) Complexity {
 // size, our proxy for capability) candidate that fits, or if none fit, the
 // smallest available as a last-resort fallback rather than refusing to
 // answer.
-func SelectTextModel(models []registry.Model, profile hw.Profile, complexity Complexity, needVision bool, exclude map[string]bool) (*registry.Model, error) {
+//
+// preferredID, when non-empty, is a user's explicit override (picked from
+// the model dropdown instead of leaving it on "Auto") — if it's among the
+// candidates that already pass the kind/vision/exclude filters, it wins
+// outright, skipping the size/budget heuristic entirely; a user's deliberate
+// pick isn't second-guessed against the hardware budget the way the
+// automatic fallback is. If the preferred model isn't in that filtered set
+// (deleted since, wrong kind, doesn't support vision when this turn needs
+// it, or already tried and failed this turn), this falls through to the
+// normal automatic selection rather than erroring.
+func SelectTextModel(models []registry.Model, profile hw.Profile, complexity Complexity, needVision bool, exclude map[string]bool, preferredID string) (*registry.Model, error) {
 	var candidates []registry.Model
 	for _, m := range models {
 		if m.Kind != registry.KindText || m.IsVisionProjector {
@@ -101,6 +111,14 @@ func SelectTextModel(models []registry.Model, profile hw.Profile, complexity Com
 	}
 	if len(candidates) == 0 {
 		return nil, fmt.Errorf("no installed text model available")
+	}
+	if preferredID != "" {
+		for _, m := range candidates {
+			if m.ID == preferredID {
+				picked := m
+				return &picked, nil
+			}
+		}
 	}
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].SizeBytes < candidates[j].SizeBytes })
 
@@ -147,11 +165,29 @@ func LooksLikeEditingModel(filename string) bool {
 // pix2pix/inpainting are deprioritized to a last resort — see
 // LooksLikeEditingModel), since Phase 1 doesn't yet infer style/quality
 // tiers beyond "best the hardware can run."
-func SelectImageModel(models []registry.Model, profile hw.Profile, exclude map[string]bool) (*registry.Model, error) {
+//
+// preferredID is the same user-override mechanism as SelectTextModel's: if
+// it names an installed, not-yet-excluded image model, that model is used
+// outright (bypassing both the budget check and the editing-model
+// deprioritization — an explicit pick is trusted as-is), otherwise this
+// falls through to the automatic pick.
+func SelectImageModel(models []registry.Model, profile hw.Profile, exclude map[string]bool, preferredID string) (*registry.Model, error) {
 	var candidates, editingCandidates []registry.Model
 	for _, m := range models {
 		if m.Kind != registry.KindImage || (exclude != nil && exclude[m.ID]) {
 			continue
+		}
+		// VAE/text-encoder component files are never themselves
+		// generatable, and a FLUX.2 checkpoint missing either of its
+		// paired component files can't run at all — both are excluded
+		// from the candidate pool entirely, not just deprioritized, since
+		// picking one would only guarantee an immediate failure.
+		if m.IsImageComponent() || !m.FluxReady() {
+			continue
+		}
+		if preferredID != "" && m.ID == preferredID {
+			picked := m
+			return &picked, nil
 		}
 		if LooksLikeEditingModel(m.Filename) {
 			editingCandidates = append(editingCandidates, m)
@@ -312,16 +348,27 @@ func maxInt(a, b int) int {
 // user-set.
 type ImageParams struct {
 	Width, Height, Steps int
+	// CFGScale, when non-zero, is passed as --cfg-scale. Left 0 (meaning
+	// "don't pass the flag, let sd-cli use its own default") for every
+	// family except FLUX/FLUX.2: those are guidance-distilled and expect
+	// cfg-scale 1.0 — sd-cli's un-flagged default (tuned for classic
+	// CFG-driven SD/SDXL models) would otherwise over-guide and degrade
+	// output badly on a Flux checkpoint.
+	CFGScale float64
 }
 
 func InferImageParams(model registry.Model, profile hw.Profile) ImageParams {
 	width, height := 512, 512
 	steps := 20
+	cfgScale := 0.0
 	switch model.ImageFamily {
-	case registry.ImageFamilySDXL, registry.ImageFamilyFlux, registry.ImageFamilySD3:
+	case registry.ImageFamilySDXL, registry.ImageFamilyFlux, registry.ImageFamilyFlux2, registry.ImageFamilySD3:
 		width, height = 1024, 1024
 	case registry.ImageFamilySD2:
 		width, height = 768, 768
+	}
+	if model.ImageFamily == registry.ImageFamilyFlux || model.ImageFamily == registry.ImageFamilyFlux2 {
+		cfgScale = 1.0
 	}
 	// CPU-only, low-RAM hardware: trade resolution/steps for a response
 	// that finishes in a reasonable time instead of a multi-minute wait.
@@ -331,7 +378,7 @@ func InferImageParams(model registry.Model, profile hw.Profile) ImageParams {
 		}
 		steps = 15
 	}
-	return ImageParams{Width: width, Height: height, Steps: steps}
+	return ImageParams{Width: width, Height: height, Steps: steps, CFGScale: cfgScale}
 }
 
 // StepDown produces smaller/faster image parameters after a failure

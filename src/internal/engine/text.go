@@ -11,9 +11,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -86,7 +89,9 @@ func StartTextServer(ctx context.Context, binPath, modelPath string, ctxTokens, 
 
 	tp := &TextProcess{cmd: cmd, port: port, baseURL: fmt.Sprintf("http://127.0.0.1:%d", port), ModelPath: modelPath, GPULayers: gpuLayers, CtxTokens: ctxTokens}
 
-	if err := waitHealthy(ctx, tp.baseURL+"/health", 90*time.Second, exited); err != nil {
+	sizeBytes := fileSizeOrZero(modelPath)
+	progress := loadProgress{pid: cmd.Process.Pid, sizeBytes: sizeBytes, label: filepath.Base(modelPath)}
+	if err := waitHealthy(ctx, tp.baseURL+"/health", healthTimeoutFor(sizeBytes), exited, progress); err != nil {
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
@@ -98,10 +103,77 @@ func StartTextServer(ctx context.Context, binPath, modelPath string, ctxTokens, 
 	return tp, nil
 }
 
+// minHealthTimeout is the floor (and the whole timeout on typical
+// fast-storage hardware) — genuinely broken small models still fail this
+// fast rather than hanging around for the scaled ceiling below.
+const minHealthTimeout = 90 * time.Second
+
+// maxHealthTimeout caps how long a legitimately-slow load is ever allowed
+// to keep retrying the health check, so a truly broken large model doesn't
+// hang around indefinitely either.
+const maxHealthTimeout = 10 * time.Minute
+
+// assumedFloorMBPerSec is a deliberately conservative disk-throughput floor
+// used only to size the timeout, not to predict real speed — a fast NVMe
+// load finishes in a fraction of the resulting budget and is unaffected;
+// this exists so a model on much slower storage (a USB/SD-based portable
+// install) isn't killed as "hung" purely for still legitimately reading a
+// multi-GB file off a slow drive, which minHealthTimeout's flat 90s alone
+// can't distinguish from an actually-stuck process.
+const assumedFloorMBPerSec = 20.0
+
+// healthTimeoutFor sizes the health-check timeout to the model file's size
+// so a large model on slow storage gets proportionally more time before
+// being judged stuck, while a small model (or any model on typical fast
+// storage) still fails within minHealthTimeout if something's really wrong.
+// sizeBytes 0 (file couldn't be stat'd) falls back to minHealthTimeout — the
+// actual load is about to fail anyway if that's the case.
+func healthTimeoutFor(sizeBytes int64) time.Duration {
+	sizeMB := float64(sizeBytes) / (1 << 20)
+	estimatedLoad := time.Duration(sizeMB / assumedFloorMBPerSec * float64(time.Second))
+	timeout := estimatedLoad + 30*time.Second // startup/health-check overhead on top of the raw read
+	if timeout < minHealthTimeout {
+		timeout = minHealthTimeout
+	}
+	if timeout > maxHealthTimeout {
+		timeout = maxHealthTimeout
+	}
+	return timeout
+}
+
+// fileSizeOrZero returns path's size, or 0 if it can't be stat'd (never an
+// error a caller needs to handle specially — every use of the result
+// already treats 0 as "no size information available").
+func fileSizeOrZero(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
+}
+
 // waitHealthy polls /health until it responds OK, the process exits (fast
 // failure — e.g. a corrupt model file), or timeout elapses.
-func waitHealthy(ctx context.Context, url string, timeout time.Duration, exited <-chan error) error {
+// loadProgress carries what a still-loading process's periodic progress
+// line needs to say — see waitHealthy's progressInterval heartbeat.
+type loadProgress struct {
+	pid       int
+	sizeBytes int64  // 0 = unknown; heartbeat then omits the percentage
+	label     string // e.g. the model's filename, for the log line
+}
+
+// progressInterval: how often waitHealthy logs a heartbeat while otherwise
+// silently polling — long loads on slow storage used to produce no output
+// at all between "loading model" and either success or a timeout error,
+// minutes later, which looked identical to a hung process from the Logs
+// tab. This guarantees at least one line every 30s for as long as the wait
+// continues, without adding one on top of a health check that resolves
+// sooner (the 300ms poll below is what actually reacts fast to success).
+const progressInterval = 30 * time.Second
+
+func waitHealthy(ctx context.Context, url string, timeout time.Duration, exited <-chan error, progress loadProgress) error {
 	deadline := time.Now().Add(timeout)
+	lastProgress := time.Now()
 	for time.Now().Before(deadline) {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		resp, err := http.DefaultClient.Do(req)
@@ -110,6 +182,10 @@ func waitHealthy(ctx context.Context, url string, timeout time.Duration, exited 
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
+		}
+		if time.Since(lastProgress) >= progressInterval {
+			lastProgress = time.Now()
+			safeLogLoadProgress(progress)
 		}
 		select {
 		case <-ctx.Done():
@@ -123,6 +199,37 @@ func waitHealthy(ctx context.Context, url string, timeout time.Duration, exited 
 		}
 	}
 	return fmt.Errorf("timed out after %s", timeout)
+}
+
+// logLoadProgress reports how far a still-loading model has gotten, using
+// the process's current resident memory as a proxy for bytes read so far —
+// llama.cpp memory-maps the weight file, so working set tracks read
+// progress closely enough to be a useful "is this actually moving" signal,
+// even though it's not an exact byte-for-byte count. Falls back to a plain
+// elapsed-time line if the platform-specific memory read isn't available
+// (see the procmem_*.go files) or the file size wasn't known.
+// safeLogLoadProgress is the only way waitHealthy ever calls
+// logLoadProgress — this is a nice-to-have log line, not something that
+// should ever get a chance to threaten the actual generation it's running
+// alongside (see processRSSBytes's Windows implementation for the incident
+// that made this the rule rather than a hypothetical).
+func safeLogLoadProgress(p loadProgress) {
+	defer func() { recover() }()
+	logLoadProgress(p)
+}
+
+func logLoadProgress(p loadProgress) {
+	rss, ok := processRSSBytes(p.pid)
+	if !ok || p.sizeBytes <= 0 {
+		log.Printf("still loading %s...", p.label)
+		return
+	}
+	pct := float64(rss) / float64(p.sizeBytes) * 100
+	if pct > 100 {
+		pct = 100
+	}
+	log.Printf("loading %s: ~%.0f%% (%.1f GB / %.1f GB)", p.label, pct,
+		float64(rss)/(1<<30), float64(p.sizeBytes)/(1<<30))
 }
 
 func lastLines(s string, n int) string {

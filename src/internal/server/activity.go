@@ -40,6 +40,7 @@ var stuckThresholds = map[ActivityKind]time.Duration{
 
 type opState struct {
 	kind      ActivityKind
+	detail    string // e.g. the specific model's display name, once known
 	startedAt time.Time
 	lastBeat  time.Time
 }
@@ -55,19 +56,34 @@ func NewActivity() *Activity {
 }
 
 // Begin starts tracking one independent operation and returns its ID (for
-// Beat) and a function to call (typically via defer) when it finishes.
-// Concurrent operations never interfere with each other's clocks.
-func (a *Activity) Begin(kind ActivityKind) (string, func()) {
+// Beat/SetDetail) and a function to call (typically via defer) when it
+// finishes. Concurrent operations never interfere with each other's clocks.
+// detail is optional extra context surfaced by ActiveDetails (typically the
+// specific model's display name) — pass "" if it isn't known yet and set it
+// later with SetDetail once it is (e.g. image generation only knows which
+// model it picked after Begin, and may change models across a fallback
+// retry within the same op).
+func (a *Activity) Begin(kind ActivityKind, detail string) (string, func()) {
 	a.mu.Lock()
 	a.seq++
 	id := fmt.Sprintf("op%d", a.seq)
-	a.ops[id] = &opState{kind: kind, startedAt: time.Now(), lastBeat: time.Now()}
+	a.ops[id] = &opState{kind: kind, detail: detail, startedAt: time.Now(), lastBeat: time.Now()}
 	a.mu.Unlock()
 	return id, func() {
 		a.mu.Lock()
 		delete(a.ops, id)
 		a.mu.Unlock()
 	}
+}
+
+// SetDetail updates operation id's detail string (see Begin) — a no-op on a
+// stale or already-ended id.
+func (a *Activity) SetDetail(id, detail string) {
+	a.mu.Lock()
+	if o, ok := a.ops[id]; ok {
+		o.detail = detail
+	}
+	a.mu.Unlock()
 }
 
 // Beat records progress on operation id (a streamed token, a download
@@ -113,4 +129,28 @@ func (a *Activity) Snapshot() ActivitySnapshot {
 		PossiblyStuck:  stuckAny,
 		Count:          len(a.ops),
 	}
+}
+
+// ActiveOp is one currently-running operation, for callers (like the active
+// models widget) that need every op rather than Snapshot's single-longest
+// summary — e.g. two chats generating images with two different models at
+// once should both show up, not just whichever started first.
+type ActiveOp struct {
+	Kind           ActivityKind `json:"kind"`
+	Detail         string       `json:"detail,omitempty"`
+	ElapsedSeconds int          `json:"elapsed_seconds"`
+}
+
+// ActiveDetails returns every currently-running operation of the given kind.
+func (a *Activity) ActiveDetails(kind ActivityKind) []ActiveOp {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []ActiveOp
+	for _, o := range a.ops {
+		if o.kind != kind {
+			continue
+		}
+		out = append(out, ActiveOp{Kind: o.kind, Detail: o.detail, ElapsedSeconds: int(time.Since(o.startedAt).Seconds())})
+	}
+	return out
 }

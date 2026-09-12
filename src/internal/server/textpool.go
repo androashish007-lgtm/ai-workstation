@@ -9,6 +9,7 @@ package server
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +29,17 @@ type poolEntry struct {
 	proc     *engine.TextProcess
 	refCount int
 	lastUsed time.Time
+	// ready is non-nil and open while this entry's process is still
+	// starting (a placeholder reserving the slot) — closed (and the entry
+	// removed from the map, on failure) once the start finishes. Only ever
+	// read/closed with p.mu held. Its purpose is letting a concurrent
+	// Acquire for a DIFFERENT model proceed immediately instead of queuing
+	// behind this one's cold start — see Acquire's doc comment for why the
+	// old design serialized every cold start through one lock held for the
+	// whole load. A waiter that wakes up to find the entry gone (the load
+	// it was waiting on failed) simply falls through to starting its own
+	// attempt, same as if nothing had ever been there.
+	ready chan struct{}
 }
 
 type TextPool struct {
@@ -44,16 +56,24 @@ func NewTextPool(profile hw.Profile) *TextPool {
 // headroom the hardware has — each concurrently-loaded model roughly costs
 // its own file size in RAM/VRAM, so more headroom buys more simultaneous
 // chats using different models before we start evicting idle ones.
+//
+// Thresholds were raised (previously 8/20/40GB) after a live incident on a
+// 16GB-RAM machine: BudgetBytes() there was ~11GB (already just this
+// machine's own single-model headroom, not a per-slot allowance), which sat
+// in the old ">= 8GB" tier and let two ~5-7GB models load at once —
+// pushing system RAM to ~90%+ and starving both. A second concurrent slot
+// now requires roughly double a typical modern model's size in headroom, so
+// two of them actually fit instead of merely being allowed to try.
 func maxConcurrentModels(p hw.Profile) int {
 	budget := p.BudgetBytes()
 	switch {
 	case budget == 0:
 		return 1
-	case budget < 8<<30:
+	case budget < 16<<30:
 		return 1
-	case budget < 20<<30:
+	case budget < 32<<30:
 		return 2
-	case budget < 40<<30:
+	case budget < 48<<30:
 		return 3
 	default:
 		return 4
@@ -62,20 +82,49 @@ func maxConcurrentModels(p hw.Profile) int {
 
 func poolKey(modelID, mmproj string) string { return modelID + "|" + mmproj }
 
-// HasResident reports whether this model is already loaded and running —
-// for callers deciding whether an extra ancillary use (e.g. a quick
+// ResidentModel is one currently-loaded text model, for the active-models
+// widget — Busy reports whether it's serving a request right now (refCount
+// > 0) vs. just kept warm for reuse.
+type ResidentModel struct {
+	ModelID  string
+	Busy     bool
+	LastUsed time.Time
+}
+
+// Snapshot lists every currently-resident (loaded) model, unkeyed by which
+// chat is using it — a model loaded once is shared across every chat that
+// picks it, so "resident" is a global, not per-session, fact. A model still
+// mid-cold-start (see Acquire) has no process yet and is left out — nothing
+// meaningful to report until it either succeeds or fails.
+func (p *TextPool) Snapshot() []ResidentModel {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]ResidentModel, 0, len(p.entries))
+	for k, e := range p.entries {
+		if e.proc == nil {
+			continue
+		}
+		modelID := k
+		if i := strings.IndexByte(k, '|'); i >= 0 {
+			modelID = k[:i]
+		}
+		out = append(out, ResidentModel{ModelID: modelID, Busy: e.refCount > 0, LastUsed: e.lastUsed})
+	}
+	return out
+}
+
+// HasResident reports whether this model is already loaded and immediately
+// usable — for callers deciding whether an extra ancillary use (e.g. a quick
 // classification aside) is basically free (an already-warm process, no
-// wait) versus would trigger a full cold start. Acquire has no timeout of
-// its own (StartTextServer's health-check wait runs up to 90s while
-// holding the pool's lock), which is fine for the one real reply a request
-// is actually waiting on, but wrong for something that's supposed to be a
-// cheap routing aid — callers doing the latter should check this first and
-// skip rather than risk that same wait.
+// wait) versus would trigger a full cold start (or a wait on someone else's
+// in-progress one). Callers doing the latter should check this first and
+// skip rather than risk that wait, since it's meant to be a cheap routing
+// aid, not something worth blocking on.
 func (p *TextPool) HasResident(modelID, mmproj string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	_, ok := p.entries[poolKey(modelID, mmproj)]
-	return ok
+	e, ok := p.entries[poolKey(modelID, mmproj)]
+	return ok && e.proc != nil
 }
 
 // Acquire returns a running TextProcess for this model, starting one if
@@ -90,34 +139,66 @@ func (p *TextPool) HasResident(modelID, mmproj string) bool {
 // to kill-and-restart-with-different-params a process you know you're the
 // sole owner of — see Discard.
 //
-// The whole operation holds one lock, including the (multi-second) process
-// start — this serializes cold starts of *different* models against each
-// other, which is an acceptable, simple way to avoid a race where two
-// concurrent first-requests for the same brand-new model each start their
-// own process and leak one. Reusing an already-running model never waits
-// on this beyond a quick map lookup.
-func (p *TextPool) Acquire(binPath string, model registry.Model, params router.TextParams, mmproj string) (proc *engine.TextProcess, release func(), started bool, err error) {
+// Cold starts of *different* models no longer serialize against each other:
+// the pool lock is only held for the brief map lookup/reservation, never
+// across the actual (multi-second-to-multi-minute, on slow storage) process
+// start — a placeholder entry (proc == nil, ready open) reserves the slot so
+// a second concurrent Acquire for the SAME brand-new model waits on that one
+// specific load via its ready channel instead of starting a duplicate
+// process, while an Acquire for any OTHER model proceeds immediately. This
+// used to share one lock for the whole load, so switching to a chat needing
+// a different, not-yet-loaded model could sit blocked for however long an
+// unrelated chat's cold start took — the opposite of the "switching chats
+// never interrupts another" this pool exists for.
+//
+// ctx is honored both for the actual process start (StartTextServer) and
+// while waiting on someone else's in-progress load — this is what makes the
+// Stop button actually interrupt a chat stuck cold-loading, rather than only
+// cancelling the request that's already given up while the load silently
+// continues in the background.
+func (p *TextPool) Acquire(ctx context.Context, binPath string, model registry.Model, params router.TextParams, mmproj string) (proc *engine.TextProcess, release func(), started bool, err error) {
 	key := poolKey(model.ID, mmproj)
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	for {
+		p.mu.Lock()
+		if e, ok := p.entries[key]; ok {
+			if e.ready != nil {
+				ready := e.ready
+				p.mu.Unlock()
+				select {
+				case <-ready:
+					continue // re-check: it's now either ready or gone (failed)
+				case <-ctx.Done():
+					return nil, nil, false, ctx.Err()
+				}
+			}
+			e.refCount++
+			e.lastUsed = time.Now()
+			p.mu.Unlock()
+			return e.proc, func() { p.release(key) }, false, nil
+		}
 
-	if e, ok := p.entries[key]; ok {
-		e.refCount++
-		e.lastUsed = time.Now()
-		return e.proc, func() { p.release(key) }, false, nil
-	}
+		if len(p.entries) >= p.maxConcurrent {
+			p.evictIdleLocked()
+		}
+		ready := make(chan struct{})
+		p.entries[key] = &poolEntry{ready: ready}
+		p.mu.Unlock()
 
-	if len(p.entries) >= p.maxConcurrent {
-		p.evictIdleLocked()
-	}
+		newProc, startErr := engine.StartTextServer(ctx, binPath, model.Path, params.ContextTokens, params.GPULayers, mmproj, parallelSlotsPerModel)
 
-	newProc, startErr := engine.StartTextServer(context.Background(), binPath, model.Path, params.ContextTokens, params.GPULayers, mmproj, parallelSlotsPerModel)
-	if startErr != nil {
-		return nil, nil, false, startErr
+		p.mu.Lock()
+		if startErr != nil {
+			delete(p.entries, key)
+			close(ready)
+			p.mu.Unlock()
+			return nil, nil, false, startErr
+		}
+		p.entries[key] = &poolEntry{proc: newProc, refCount: 1, lastUsed: time.Now()}
+		close(ready)
+		p.mu.Unlock()
+		return newProc, func() { p.release(key) }, true, nil
 	}
-	p.entries[key] = &poolEntry{proc: newProc, refCount: 1, lastUsed: time.Now()}
-	return newProc, func() { p.release(key) }, true, nil
 }
 
 func (p *TextPool) release(key string) {
@@ -138,21 +219,22 @@ func (p *TextPool) Discard(model registry.Model, mmproj string) {
 	key := poolKey(model.ID, mmproj)
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if e, ok := p.entries[key]; ok {
+	if e, ok := p.entries[key]; ok && e.proc != nil {
 		e.proc.Stop()
 		delete(p.entries, key)
 	}
 }
 
 // evictIdleLocked drops the least-recently-used process with no active
-// users, freeing a pool slot. If every running process is currently busy,
-// it does nothing — Acquire just starts one more, temporarily exceeding the
-// cap rather than blocking a user's request indefinitely.
+// users, freeing a pool slot. If every running process is currently busy
+// (or still mid-cold-start — never a valid eviction target), it does
+// nothing — Acquire just starts one more, temporarily exceeding the cap
+// rather than blocking a user's request indefinitely.
 func (p *TextPool) evictIdleLocked() {
 	var victimKey string
 	var oldest time.Time
 	for k, e := range p.entries {
-		if e.refCount > 0 {
+		if e.proc == nil || e.refCount > 0 {
 			continue
 		}
 		if victimKey == "" || e.lastUsed.Before(oldest) {
@@ -170,7 +252,9 @@ func (p *TextPool) StopAll() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for k, e := range p.entries {
-		e.proc.Stop()
+		if e.proc != nil {
+			e.proc.Stop()
+		}
 		delete(p.entries, k)
 	}
 }

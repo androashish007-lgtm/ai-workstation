@@ -39,6 +39,25 @@ const (
 	ImageFamilySDXL    ImageFamily = "sdxl"
 	ImageFamilyFlux    ImageFamily = "flux"
 	ImageFamilySD3     ImageFamily = "sd3"
+	// ImageFamilyFlux2 is BFL's FLUX.2 line (klein/dev) — unlike every other
+	// family here, stable-diffusion.cpp can't run it from one checkpoint
+	// file: it needs the diffusion model, a separate VAE, and a separate
+	// LLM text encoder passed as three distinct files (see Model.ImageRole
+	// and PairedVAE/PairedTextEncoder below).
+	ImageFamilyFlux2 ImageFamily = "flux2"
+)
+
+// ImageRole classifies an image-kind file as either a standalone checkpoint
+// (the default, empty value — everything before FLUX.2) or one of the two
+// component files a FLUX.2 diffusion model needs alongside it. Component
+// files are never themselves selectable/generatable — they only exist to be
+// paired onto a Flux2-family checkpoint (see linkFluxComponents).
+type ImageRole string
+
+const (
+	ImageRoleCheckpoint  ImageRole = "" // a normal, standalone image model
+	ImageRoleVAE         ImageRole = "vae"
+	ImageRoleTextEncoder ImageRole = "text_encoder"
 )
 
 // Model is one registered file: a fingerprinted, classified entry the router
@@ -57,8 +76,15 @@ type Model struct {
 	IsVisionProjector bool        `json:"is_vision_projector,omitempty"`
 	PairedProjector   string      `json:"paired_projector,omitempty"` // filename of matched mmproj, if any
 	ImageFamily       ImageFamily `json:"image_family,omitempty"`
-	DetectedAt        time.Time   `json:"detected_at"`
-	ParseError        string      `json:"parse_error,omitempty"`
+	// ImageRole/PairedVAE/PairedTextEncoder exist only for FLUX.2 support —
+	// see ImageRole's doc comment. Both Paired* fields hold filenames (not
+	// full paths, matching PairedProjector's convention) and are only ever
+	// set on a Kind==KindImage, ImageFamily==ImageFamilyFlux2 checkpoint.
+	ImageRole         ImageRole `json:"image_role,omitempty"`
+	PairedVAE         string    `json:"paired_vae,omitempty"`
+	PairedTextEncoder string    `json:"paired_text_encoder,omitempty"`
+	DetectedAt        time.Time `json:"detected_at"`
+	ParseError        string    `json:"parse_error,omitempty"`
 }
 
 // VisionCapable reports whether this text model has a paired multimodal
@@ -67,27 +93,82 @@ func (m Model) VisionCapable() bool {
 	return m.PairedProjector != ""
 }
 
+// IsImageComponent reports whether this is a FLUX.2 VAE/text-encoder file
+// rather than a standalone, selectable image checkpoint.
+func (m Model) IsImageComponent() bool {
+	return m.ImageRole != ImageRoleCheckpoint
+}
+
+// FluxReady reports whether a FLUX.2 checkpoint has both files it needs to
+// actually run alongside it. Always true for every other family/role, since
+// only FLUX.2 checkpoints have this extra requirement.
+func (m Model) FluxReady() bool {
+	if m.ImageFamily != ImageFamilyFlux2 || m.IsImageComponent() {
+		return true
+	}
+	return m.PairedVAE != "" && m.PairedTextEncoder != ""
+}
+
 type snapshot struct {
 	Models map[string]Model `json:"models"` // key: absolute path
 }
 
 // Registry is the in-memory, mutex-protected, disk-backed model catalog.
 type Registry struct {
-	mu       sync.RWMutex
-	models   map[string]Model // key: absolute path
-	dataFile string
-	textDir  string
-	imageDir string
-	onChange func()
+	mu        sync.RWMutex
+	models    map[string]Model // key: absolute path
+	dataFile  string
+	textDirs  []string          // scanned in order; index 0 is this app's own default models/text folder
+	imageDirs []string          // same, for models/image
+	watcher   *fsnotify.Watcher // set once Watch() is running; nil otherwise (SetDirs then only updates the dir lists, no live watch to extend)
+	onChange  func()
 }
 
-func New(dataDir, textDir, imageDir string) *Registry {
+// New builds a registry that scans textDirs/imageDirs — each normally a
+// single-element slice (this app's own models/text or models/image folder)
+// unless the user has added extra folders via SetDirs (e.g. a faster drive
+// alongside the portable default).
+func New(dataDir string, textDirs, imageDirs []string) *Registry {
 	return &Registry{
-		models:   map[string]Model{},
-		dataFile: filepath.Join(dataDir, "registry.json"),
-		textDir:  textDir,
-		imageDir: imageDir,
+		models:    map[string]Model{},
+		dataFile:  filepath.Join(dataDir, "registry.json"),
+		textDirs:  textDirs,
+		imageDirs: imageDirs,
 	}
+}
+
+// Dirs returns the current folders scanned for one kind, in scan order.
+func (r *Registry) Dirs(kind ModelKind) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if kind == KindText {
+		return append([]string{}, r.textDirs...)
+	}
+	return append([]string{}, r.imageDirs...)
+}
+
+// SetDirs replaces the full list of folders scanned for one kind and
+// rescans immediately. Callers are expected to keep index 0 as this app's
+// own default folder (SetDirs itself doesn't enforce that) — see
+// handlers_api.go's model-dirs endpoint, which always does. Best-effort
+// extends the live file watcher (if running) to the new folders; a folder
+// removed from the list simply stops being scanned on the next rescan
+// rather than having its stale watch explicitly torn down.
+func (r *Registry) SetDirs(kind ModelKind, dirs []string) {
+	r.mu.Lock()
+	if kind == KindText {
+		r.textDirs = dirs
+	} else {
+		r.imageDirs = dirs
+	}
+	w := r.watcher
+	r.mu.Unlock()
+	if w != nil {
+		for _, d := range dirs {
+			w.Add(d) // best-effort: already watched, or doesn't exist yet
+		}
+	}
+	r.RescanAll()
 }
 
 // OnChange registers a callback fired (best-effort, non-blocking) whenever
@@ -134,14 +215,21 @@ func (r *Registry) save() {
 	os.Rename(tmp, r.dataFile)
 }
 
-// RescanAll walks both model directories, registers anything new or changed,
-// and drops entries whose file no longer exists.
+// RescanAll walks every configured model directory (see Dirs/SetDirs),
+// registers anything new or changed, and drops entries whose file no longer
+// exists (whether because it was deleted, or because its folder was
+// removed from the scanned list).
 func (r *Registry) RescanAll() {
+	r.mu.RLock()
+	textDirs := append([]string{}, r.textDirs...)
+	imageDirs := append([]string{}, r.imageDirs...)
+	r.mu.RUnlock()
+
 	seen := map[string]bool{}
-	for _, dir := range []string{r.textDir, r.imageDir} {
+	scan := func(dir string, isText bool) {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
-			continue
+			return
 		}
 		for _, e := range entries {
 			if e.IsDir() || strings.HasSuffix(e.Name(), ".part") || strings.HasPrefix(e.Name(), ".") {
@@ -156,8 +244,14 @@ func (r *Registry) RescanAll() {
 				continue
 			}
 			seen[abs] = true
-			r.registerIfChanged(abs, dir == r.textDir)
+			r.registerIfChanged(abs, isText)
 		}
+	}
+	for _, dir := range textDirs {
+		scan(dir, true)
+	}
+	for _, dir := range imageDirs {
+		scan(dir, false)
 	}
 	r.mu.Lock()
 	changed := false
@@ -169,9 +263,45 @@ func (r *Registry) RescanAll() {
 	}
 	r.mu.Unlock()
 	r.linkVisionProjectors()
+	r.linkFluxComponents()
 	if changed {
 		r.save()
 		r.notify()
+	}
+}
+
+// linkFluxComponents pairs the installed VAE and text-encoder files onto
+// every installed FLUX.2 checkpoint. Unlike linkVisionProjectors, there's no
+// filename relationship to match on (a diffusion model, its VAE, and its
+// text encoder are published under completely unrelated names) — instead
+// this assumes the common single-user case of at most one VAE and one
+// text-encoder file installed at a time (they're shared across every
+// klein/dev size per stable-diffusion.cpp's own docs) and pairs whichever
+// one of each is found onto every Flux2-family checkpoint.
+func (r *Registry) linkFluxComponents() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var vaeFile, teFile string
+	for _, m := range r.models {
+		if m.Kind != KindImage {
+			continue
+		}
+		if m.ImageRole == ImageRoleVAE && vaeFile == "" {
+			vaeFile = m.Filename
+		}
+		if m.ImageRole == ImageRoleTextEncoder && teFile == "" {
+			teFile = m.Filename
+		}
+	}
+	for path, m := range r.models {
+		if m.Kind != KindImage || m.ImageFamily != ImageFamilyFlux2 || m.IsImageComponent() {
+			continue
+		}
+		if m.PairedVAE != vaeFile || m.PairedTextEncoder != teFile {
+			m.PairedVAE = vaeFile
+			m.PairedTextEncoder = teFile
+			r.models[path] = m
+		}
 	}
 }
 
@@ -184,7 +314,26 @@ func (r *Registry) registerIfChanged(absPath string, isText bool) {
 	existing, ok := r.models[absPath]
 	r.mu.RUnlock()
 	if ok && existing.SizeBytes == info.Size() {
-		return // cheap heuristic: same size, assume unchanged, skip re-hashing multi-GB files
+		// Same size: assume unchanged, skip re-hashing multi-GB files — but
+		// still cheaply re-derive filename-based classification (image
+		// family/role) from scratch every scan, without re-reading the file.
+		// Otherwise a model registered before a classifier change (e.g. the
+		// FLUX.2 family/VAE/text-encoder detection added alongside this
+		// comment) would keep its stale pre-upgrade classification forever,
+		// since nothing else ever prompts a full re-fingerprint of a file
+		// whose size hasn't changed.
+		if !isText {
+			refreshed := existing
+			refreshed.ImageFamily = guessImageFamily(refreshed.Filename, refreshed.Architecture)
+			refreshed.ImageRole = guessImageRole(refreshed.Filename)
+			if refreshed.ImageFamily != existing.ImageFamily || refreshed.ImageRole != existing.ImageRole {
+				r.mu.Lock()
+				r.models[absPath] = refreshed
+				r.mu.Unlock()
+				r.save()
+			}
+		}
+		return
 	}
 
 	// The same file may already be registered under a different absolute
@@ -253,6 +402,8 @@ func fingerprintAndClassify(absPath string, isText bool) (Model, error) {
 	}
 	if isText {
 		m.Kind = KindText
+	} else {
+		m.ImageRole = guessImageRole(m.Filename)
 	}
 	meta, err := ParseGGUFMeta(absPath)
 	if err != nil {
@@ -276,6 +427,10 @@ func fingerprintAndClassify(absPath string, isText bool) (Model, error) {
 func guessImageFamily(filename, architecture string) ImageFamily {
 	f := strings.ToLower(filename + " " + architecture)
 	switch {
+	// Checked before the plain "flux" case below since "flux-2"/"flux2"
+	// always also contains "flux".
+	case strings.Contains(f, "flux2") || strings.Contains(f, "flux-2") || strings.Contains(f, "flux.2") || strings.Contains(f, "flux_2"):
+		return ImageFamilyFlux2
 	case strings.Contains(f, "flux"):
 		return ImageFamilyFlux
 	case strings.Contains(f, "sdxl") || strings.Contains(f, "xl"):
@@ -288,6 +443,22 @@ func guessImageFamily(filename, architecture string) ImageFamily {
 		return ImageFamilySD15
 	}
 	return ImageFamilyUnknown
+}
+
+// guessImageRole flags a FLUX.2 VAE or text-encoder file by filename —
+// there's no metadata to parse for a role like this (they're ordinary
+// safetensors/GGUF weight files), but every source that publishes them
+// (black-forest-labs, unsloth, city96, leejet's own GGUF repos) names them
+// this way, matching stable-diffusion.cpp's own docs (docs/flux2.md).
+func guessImageRole(filename string) ImageRole {
+	f := strings.ToLower(filename)
+	switch {
+	case strings.Contains(f, "vae") || strings.Contains(f, "_ae.") || strings.Contains(f, "-ae."):
+		return ImageRoleVAE
+	case strings.Contains(f, "qwen") || strings.Contains(f, "mistral-small"):
+		return ImageRoleTextEncoder
+	}
+	return ImageRoleCheckpoint
 }
 
 // linkVisionProjectors pairs mmproj-style projector files with the base text
@@ -365,6 +536,17 @@ func (r *Registry) ByKind(kind ModelKind) []Model {
 	return out
 }
 
+// Has reports whether a model with this ID and kind is currently installed
+// — used to validate a user's explicit model pick before persisting it.
+func (r *Registry) Has(kind ModelKind, id string) bool {
+	for _, m := range r.Snapshot() {
+		if m.Kind == kind && m.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
 // Watch runs an fsnotify watcher on both model folders until ctx-like stop
 // channel closes. Falls back silently to relying on RescanAll-on-demand if
 // the watcher can't be created (e.g. exotic filesystem on some Android
@@ -377,7 +559,11 @@ func (r *Registry) Watch(stop <-chan struct{}) {
 		return
 	}
 	defer w.Close()
-	for _, dir := range []string{r.textDir, r.imageDir} {
+	r.mu.Lock()
+	r.watcher = w
+	dirs := append(append([]string{}, r.textDirs...), r.imageDirs...)
+	r.mu.Unlock()
+	for _, dir := range dirs {
 		if err := w.Add(dir); err != nil {
 			log.Printf("registry: could not watch %s: %v", dir, err)
 		}

@@ -7,9 +7,11 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"aistation/internal/engine"
 	"aistation/internal/hw"
 	"aistation/internal/imageperf"
+	"aistation/internal/logbuf"
 	"aistation/internal/project"
 	"aistation/internal/registry"
 	"aistation/internal/session"
@@ -50,6 +53,7 @@ type App struct {
 	usageLog    *usagelog.Log
 	imagePerf   *imageperf.Store
 	projects    *project.Store
+	logs        *logbuf.Buffer
 
 	mu                    sync.Mutex
 	textBinPath           string
@@ -84,12 +88,20 @@ func NewApp(root string) (*App, error) {
 		Downloads:   filepath.Join(root, "data", "downloads"),
 	}
 
+	logs := logbuf.New(4000)
+	setupLogging(dirs.Data, logs)
+
 	profile := hw.Detect()
 	log.Printf("hardware: %s/%s, %d cores, %.1fGB RAM, GPU=%s (%s)",
 		profile.OS, profile.Arch, profile.CPUCores,
 		float64(profile.TotalRAMBytes)/(1<<30), profile.GPUVendor, profile.GPUName)
 
-	reg := registry.New(dirs.Data, dirs.ModelsText, dirs.ModelsImage)
+	config := session.NewConfigStore(dirs.Data)
+	cfg := config.Load()
+
+	reg := registry.New(dirs.Data,
+		append([]string{dirs.ModelsText}, cfg.ExtraModelDirsText...),
+		append([]string{dirs.ModelsImage}, cfg.ExtraModelDirsImage...))
 	if err := reg.Load(); err != nil {
 		return nil, fmt.Errorf("loading model registry: %w", err)
 	}
@@ -102,7 +114,6 @@ func NewApp(root string) (*App, error) {
 
 	mgr := engine.NewManager(dirs.Engines, profile)
 	sessions := session.NewManager(dirs.Sessions)
-	config := session.NewConfigStore(dirs.Data)
 	activity := NewActivity()
 
 	return &App{
@@ -120,7 +131,35 @@ func NewApp(root string) (*App, error) {
 		usageLog:    usagelog.New(dirs.Data),
 		imagePerf:   imageperf.New(dirs.Data),
 		projects:    project.New(dirs.Data),
+		logs:        logs,
 	}, nil
+}
+
+// setupLogging routes every log.Printf (and the standard logger's default
+// output generally) to three places at once: stderr (unchanged behavior —
+// still visible in the console window start.bat/start.sh open), a plain
+// text file on disk for after-the-fact debugging, and the in-memory ring
+// buffer the Settings > Logs tab tails live. Previously only stderr existed
+// — closing the console window lost everything, and there was no way to
+// see what happened without keeping that window open the whole time.
+func setupLogging(dataDir string, buf *logbuf.Buffer) {
+	logDir := filepath.Join(dataDir, "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, buf))
+		return
+	}
+	logPath := filepath.Join(logDir, "app.log")
+	// Keep exactly one prior run's log around (app.log.1) rather than
+	// growing unboundedly — this is a debugging aid, not an audit trail.
+	if _, err := os.Stat(logPath); err == nil {
+		os.Rename(logPath, logPath+".1")
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		log.SetOutput(io.MultiWriter(os.Stderr, buf))
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, f, buf))
 }
 
 func (a *App) Registry() *registry.Registry { return a.reg }
@@ -225,6 +264,10 @@ func (a *App) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/lan-url", a.handleLANURL)
 	mux.HandleFunc("GET /api/system/usage", a.handleSystemUsage)
 	mux.HandleFunc("GET /api/usage/models", a.handleModelUsage)
+	mux.HandleFunc("GET /api/usage/active-models", a.handleActiveModels)
 	mux.HandleFunc("DELETE /api/models/{id}", a.handleDeleteModel)
+	mux.HandleFunc("GET /api/logs", a.handleLogs)
+	mux.HandleFunc("GET /api/model-dirs", a.handleGetModelDirs)
+	mux.HandleFunc("POST /api/model-dirs", a.handleSetModelDirs)
 	mux.HandleFunc("GET /images/{session}/{file}", a.handleImage)
 }

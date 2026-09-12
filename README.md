@@ -1,10 +1,60 @@
 # AI Workstation (portable, offline-first)
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android-lightgrey)
+![Zero config](https://img.shields.io/badge/setup-zero%20config-brightgreen)
+
 A self-contained AI chat + image-generation workstation that runs from this
 folder — a USB drive, an external SSD, or a plain local directory — on
 Windows, macOS, Linux, and Android (Termux). Nothing is installed
 system-wide; everything the app needs (engines, models, history) lives in
 this folder.
+
+## Highlights
+
+- **🔌 Truly portable** — the whole app (binaries, engines, models, chat
+  history) lives in one folder. Run it from a USB stick, an external SSD,
+  or a plain local directory; move the folder to a different drive letter
+  or a different machine and it keeps working, no reinstall.
+- **🧠 Auto-detects your hardware and adapts** — CPU cores, total/available
+  RAM, GPU vendor and name are detected on every launch (and re-checked
+  before every model load), driving every decision below without you
+  touching a setting.
+- **🖥️ GPU acceleration with automatic CPU fallback** — Vulkan-accelerated
+  builds are used automatically the moment a GPU is detected (NVIDIA, AMD,
+  or Intel integrated — one backend covers all three, no CUDA/OpenVINO
+  needed). If GPU offload fails partway (a real failure mode on
+  memory-constrained or integrated GPUs), it steps back through a graduated
+  offload ladder before ever falling back to CPU-only, rather than just
+  crashing.
+- **📉 Model fallback to lower specs on failure** — an out-of-memory or
+  load failure automatically retries with reduced context/output settings,
+  then falls back to the next-best installed model, before ever surfacing
+  a raw error to you.
+- **💡 Model recommendations sized to your machine** — when nothing
+  installed fits a request, the chat UI suggests a specific model sized
+  for your actual CPU/RAM/GPU, with a one-click, progress-tracked download
+  — nothing is ever fetched without that click.
+- **🎛️ Auto-routing with a manual override when you want it** — text vs.
+  image intent, which installed model to use, and context/resolution/step
+  parameters are all inferred per request. Prefer to choose yourself? The
+  💬/🖼 dropdowns next to the composer list every installed model so you
+  can pin a chat to a specific one, per chat, any time.
+- **📊 Live diagnostics, not guesswork** — a Settings panel with a live
+  log tail, a "what's actually loaded/generating right now" widget, and
+  periodic progress heartbeats (e.g. `loading model: ~62% (3.1 GB / 5.0
+  GB)`) while a model is loading, so a slow first load on modest hardware
+  never just looks stuck.
+- **👁️ Vision-capable chat** — drop a multimodal projector alongside a
+  chat model and it's paired automatically by filename; attach images to
+  any message once it's installed.
+- **🗂️ Projects** — group chats under shared background context/instructions
+  without repeating yourself in every conversation.
+- **📱 Phone/tablet access, no cloud** — a QR code to the same UI over your
+  local network; no account, no relay, no telemetry.
+- **🌍 Cross-platform out of the box** — prebuilt binaries in `bin/` for
+  Windows (x64/ARM64), macOS (Intel/Apple Silicon), Linux (x64/ARM64/ARMv7),
+  and Android via Termux — pick your platform and run, no build step.
 
 ## Quick start
 
@@ -18,9 +68,12 @@ One command installs (downloads the inference engines, with your approval),
 configures, and launches — every time. The browser opens automatically to
 the chat UI.
 
-There are no settings to configure and no model to pick: type a message and
-the system figures out which installed model to use, whether the request
-needs text or an image, and what parameters to run it with.
+There's nothing to configure to get started: type a message and the system
+figures out which installed model to use, whether the request needs text or
+an image, and what parameters to run it with. If you'd rather choose
+yourself, the 💬/🖼 dropdowns above the message box list every installed
+model — pick one to pin this chat to it, or leave them on "Auto
+(recommended)" for the automatic behavior above.
 
 ## What's in this folder
 
@@ -46,6 +99,18 @@ projector (an `mmproj-*.gguf` file, usually published alongside the main
 model) in `models/text/` too. The app pairs them automatically by matching
 filenames — keep the base model and its projector's names similar (e.g.
 `qwen2.5-vl-7b.gguf` and `qwen2.5-vl-7b-mmproj.gguf`).
+
+**FLUX.2 image models**: unlike every other supported image model, FLUX.2
+(klein/dev) needs three separate files in `models/image/` — the diffusion
+model itself, a VAE (filename containing `vae` or `_ae`/`-ae`), and a text-
+encoder LLM (filename containing `qwen` or `mistral-small`, matching how
+every published source names these). The app auto-pairs whichever VAE and
+text-encoder it finds onto every installed FLUX.2 checkpoint; if either is
+missing, that checkpoint shows as disabled in the model dropdown with what's
+missing, and is skipped automatically rather than being picked. A single
+merged FLUX.2 safetensors file (e.g. an all-in-one repack) is **not**
+enough — stable-diffusion.cpp requires the three components as distinct
+files, so a monolithic download won't work here.
 
 If nothing installed fits a request (or the folders are empty), the chat UI
 suggests a model sized for your hardware with a one-click download —
@@ -184,6 +249,27 @@ macOS (Intel/Apple Silicon), Linux (x64/ARM64/ARMv7), and Termux (ARM64/
 ARMv7). If you ever need to rebuild after editing `src/`, see
 `TROUBLESHOOTING.md`.
 
+## Contributing
+
+Bug reports, feature suggestions, and PRs are all welcome — this is an
+early-stage project and there's a lot of room to shape where it goes.
+
+- **Found a bug or something confusing?** Open an issue. Include your OS,
+  whether a GPU was detected (the startup log's `GPU=...` line), and
+  what you expected vs. what happened.
+- **Have an idea for an enhancement?** Open an issue describing the
+  use case, even (especially) if you haven't worked out the implementation
+  — the "Phase 2" list below is exactly that kind of idea, not a committed
+  roadmap, and PRs against any of it (or something not on it) are welcome.
+- **Want to send a PR?** The whole app is Go (`src/`, standard library
+  `net/http`, no framework) on the backend and vanilla HTML/CSS/JS on the
+  frontend (no build step — edit `src/internal/server/webui/*` and
+  refresh). `TROUBLESHOOTING.md` covers building the binaries locally. Keep
+  changes focused, match the existing comment style (explaining *why*, not
+  *what*), and it's fine to open a PR before it's finished to discuss
+  direction first.
+- **No CLA, no contributor agreement** — just send the PR.
+
 ## Phase 2 (not built yet)
 
 ### Near-term / mechanical
@@ -250,3 +336,7 @@ ARMv7). If you ever need to rebuild after editing `src/`, see
   - [Split-brain orchestration](https://tinyhumans.gitbook.io/openhuman/features/orchestration) —
     a fast reflex agent triages inbound requests while a deeper reasoning
     core delegates to worker fleets
+
+## License
+
+[MIT](LICENSE) — use it, fork it, ship it, no strings attached.

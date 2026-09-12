@@ -11,6 +11,9 @@
     <span id="statusDot" class="status-dot"></span>
     <span id="statusText" class="status-text">CPU –% · RAM –%</span>
   </div>
+  <div id="activeModelsBadge" class="status-badge active-models-badge" hidden title="Which model is currently loaded/generating">
+    <span id="activeModelsText" class="status-text"></span>
+  </div>
 
   <div id="app">
     <aside id="sidebar">
@@ -20,14 +23,7 @@
       </div>
       <div id="sessionList" class="session-list"></div>
       <div class="sidebar-footer">
-        <div class="tab-row">
-          <button id="tabChat" class="tab-btn active">Chat</button>
-          <button id="tabUsage" class="tab-btn">Model usage</button>
-        </div>
-        <button id="qrBtn" title="Show LAN access QR code">📱 Phone access</button>
-        <button id="updateCheckBtn" title="Check GitHub for a newer version">🔄 Check for updates</button>
-        <div id="updateStatus" class="hw-line" hidden></div>
-        <button id="deleteAllBtn" class="danger-btn" title="Delete every chat">🗑 Delete all chats</button>
+        <button id="settingsBtn" title="Settings">⚙ Settings</button>
         <div id="hwLine" class="hw-line"></div>
       </div>
     </aside>
@@ -35,6 +31,16 @@
       <div id="chatPanel" class="panel">
         <div id="messages"></div>
         <div id="suggestionArea"></div>
+        <div id="modelPickerRow" class="model-picker-row">
+          <label class="model-picker" title="Which chat model answers your messages in this chat">
+            💬
+            <select id="textModelSelect"></select>
+          </label>
+          <label class="model-picker" title="Which model draws images in this chat">
+            🖼
+            <select id="imageModelSelect"></select>
+          </label>
+        </div>
         <form id="composer">
           <textarea id="input" placeholder="Message the assistant — text or image, it figures out which…" rows="1"></textarea>
           <label id="attachBtn" class="attach-btn" title="Attach an image">
@@ -44,22 +50,77 @@
         </form>
         <div id="attachPreview" class="attach-preview" hidden></div>
       </div>
-      <div id="usagePanel" class="panel" hidden>
-        <div class="usage-header">
-          <h2>Model usage</h2>
-          <p class="hw-line">Every installed model, what it's best for, and how often it's actually been used — delete anything not worth the disk space.</p>
-        </div>
-        <div id="usageTable" class="usage-table"></div>
-      </div>
     </main>
   </div>
 
-  <div id="qrModal" class="modal" hidden>
-    <div class="modal-card">
-      <h3>Scan to open on your phone/tablet</h3>
-      <img id="qrImg" alt="QR code">
-      <div id="qrUrl" class="qr-url"></div>
-      <button id="qrClose">Close</button>
+  <div id="settingsModal" class="modal" hidden>
+    <div class="modal-card modal-card-wide settings-card">
+      <h3>Settings</h3>
+      <div class="settings-tab-row">
+        <button id="settingsTabUsage" class="settings-tab-btn active">Model usage</button>
+        <button id="settingsTabDirs" class="settings-tab-btn">Model folders</button>
+        <button id="settingsTabPhone" class="settings-tab-btn">Phone access</button>
+        <button id="settingsTabUpdates" class="settings-tab-btn">Updates</button>
+        <button id="settingsTabLogs" class="settings-tab-btn">Logs</button>
+        <button id="settingsTabData" class="settings-tab-btn">Data</button>
+      </div>
+
+      <div id="settingsUsageSection" class="settings-section">
+        <p class="hw-line">Every installed model, what it's best for, and how often it's actually been used — delete anything not worth the disk space.</p>
+        <div id="usageTable" class="usage-table"></div>
+      </div>
+
+      <div id="settingsDirsSection" class="settings-section" hidden>
+        <p class="hw-line">This app always looks in its own <code>models/text</code> and <code>models/image</code>
+          folders. Add extra folders below (e.g. one on a faster internal drive) to also scan those —
+          you move the actual files there yourself; this only tells the app where to look.</p>
+        <div class="model-dirs-section">
+          <h4>Text models</h4>
+          <div class="model-dirs-default" id="textDirsDefault"></div>
+          <div id="textDirsList" class="model-dirs-list"></div>
+          <div class="model-dirs-add-row">
+            <input id="textDirInput" type="text" placeholder="D:\FastModels\text" class="project-input">
+            <button id="textDirAddBtn" class="secondary-btn">+ Add</button>
+          </div>
+        </div>
+        <div class="model-dirs-section">
+          <h4>Image models</h4>
+          <div class="model-dirs-default" id="imageDirsDefault"></div>
+          <div id="imageDirsList" class="model-dirs-list"></div>
+          <div class="model-dirs-add-row">
+            <input id="imageDirInput" type="text" placeholder="D:\FastModels\image" class="project-input">
+            <button id="imageDirAddBtn" class="secondary-btn">+ Add</button>
+          </div>
+        </div>
+        <div id="modelDirsError" class="model-dirs-error" hidden></div>
+      </div>
+
+      <div id="settingsPhoneSection" class="settings-section" hidden>
+        <p class="hw-line">Scan this from your phone/tablet on the same network to open the same chats there.</p>
+        <img id="qrImg" alt="QR code">
+        <div id="qrUrl" class="qr-url"></div>
+      </div>
+
+      <div id="settingsLogsSection" class="settings-section" hidden>
+        <p class="hw-line">Live tail of this app's own log — the same stream that would otherwise only be
+          visible in the console window, plus <code>data/logs/app.log</code> on disk.</p>
+        <pre id="logsView" class="logs-view"></pre>
+      </div>
+
+      <div id="settingsUpdatesSection" class="settings-section" hidden>
+        <button id="updateCheckBtn" title="Check GitHub for a newer version">🔄 Check for updates</button>
+        <div id="updateStatus" class="hw-line" hidden></div>
+      </div>
+
+      <div id="settingsDataSection" class="settings-section" hidden>
+        <p class="hw-line">Permanently deletes every chat (any still generating a response are skipped).</p>
+        <button id="deleteAllBtn" class="danger-btn" title="Delete every chat">🗑 Delete all chats</button>
+      </div>
+
+      <div class="modal-actions">
+        <span class="modal-actions-spacer"></span>
+        <button id="settingsCloseBtn">Done</button>
+      </div>
     </div>
   </div>
 

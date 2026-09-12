@@ -27,29 +27,34 @@ const (
 // ImagePaths holds one or more images the user attached to their own
 // message (as input for the assistant to look at, not something it made).
 type Message struct {
-	Role       Role      `json:"role"`
-	Content    string    `json:"content"`
-	ImagePath  string    `json:"image_path,omitempty"`
-	ImagePaths []string  `json:"image_paths,omitempty"`
+	Role       Role     `json:"role"`
+	Content    string   `json:"content"`
+	ImagePath  string   `json:"image_path,omitempty"`
+	ImagePaths []string `json:"image_paths,omitempty"`
 	// Notice marks a persisted assistant message that stands in for a live
 	// event the UI might have missed (no matching model installed, an
 	// engine needs approval) — its value tells the frontend which live
 	// suggestion/approval card to (re-)fetch and show alongside this
 	// message, since the actual action (a Download or Approve button)
 	// needs current data, not whatever was true when this was saved.
-	Notice     string    `json:"notice,omitempty"`
-	Timestamp  time.Time `json:"timestamp"`
+	Notice    string    `json:"notice,omitempty"`
+	Timestamp time.Time `json:"timestamp"`
 }
 
 type Session struct {
-	ID          string    `json:"id"`
-	Title       string    `json:"title"`
-	Messages    []Message `json:"messages"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	LastTextID  string    `json:"last_text_model_id,omitempty"`
-	LastImageID string    `json:"last_image_model_id,omitempty"`
-	ProjectID   string    `json:"project_id,omitempty"`
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Messages  []Message `json:"messages"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	// LastTextID/LastImageID hold the user's explicit model pick for this
+	// chat, from the model dropdown next to the composer — empty means
+	// "Auto", i.e. leave it to the router's automatic hardware/complexity
+	// fit as before. Set via PATCH /api/sessions/{id}, read by the router's
+	// SelectTextModel/SelectImageModel preferredID param each turn.
+	LastTextID  string `json:"last_text_model_id,omitempty"`
+	LastImageID string `json:"last_image_model_id,omitempty"`
+	ProjectID   string `json:"project_id,omitempty"`
 }
 
 type Summary struct {
@@ -156,6 +161,12 @@ type Config struct {
 	ActiveSessionID string `json:"active_session_id,omitempty"`
 	Port            int    `json:"port,omitempty"`
 	LANEnabled      bool   `json:"lan_enabled"`
+	// ExtraModelDirsText/Image are additional folders (beyond this app's
+	// own default models/text or models/image) also scanned for installed
+	// models — e.g. a folder on a faster internal drive. The default
+	// folder is always scanned too and isn't stored here.
+	ExtraModelDirsText  []string `json:"extra_model_dirs_text,omitempty"`
+	ExtraModelDirsImage []string `json:"extra_model_dirs_image,omitempty"`
 }
 
 type ConfigStore struct {

@@ -229,7 +229,7 @@ func (a *App) persistNotice(sess *session.Session, text, notice string) {
 // not something worth retrying or reporting to the user).
 func (a *App) generateTitle(sessionID, userText, assistantText string) {
 	models := a.reg.ByKind(registry.KindText)
-	model, err := router.SelectTextModel(models, a.profile, router.ComplexitySimple, false, nil)
+	model, err := router.SelectTextModel(models, a.profile, router.ComplexitySimple, false, nil, "")
 	if err != nil {
 		return
 	}
@@ -247,7 +247,7 @@ func (a *App) generateTitle(sessionID, userText, assistantText string) {
 	params := router.InferTextParams(*model, a.profile, len(prompt), router.ComplexitySimple)
 	params.MaxTokens = 16 // a title needs a handful of tokens, not the usual reply budget
 
-	tp, release, _, err := a.textPool.Acquire(binPath, *model, params, "")
+	tp, release, _, err := a.textPool.Acquire(context.Background(), binPath, *model, params, "")
 	if err != nil {
 		return // most likely a load failure (see runTextTurn) — not worth retrying for a title
 	}
@@ -295,7 +295,7 @@ func (a *App) classifyIntent(text string, hasAttachment bool) router.Intent {
 		return fallback
 	}
 	models := a.reg.ByKind(registry.KindText)
-	model, err := router.SelectTextModel(models, a.profile, router.ComplexitySimple, false, nil)
+	model, err := router.SelectTextModel(models, a.profile, router.ComplexitySimple, false, nil, "")
 	if err != nil {
 		return fallback
 	}
@@ -321,7 +321,7 @@ func (a *App) classifyIntent(text string, hasAttachment bool) router.Intent {
 	params := router.InferTextParams(*model, a.profile, len(prompt), router.ComplexitySimple)
 	params.MaxTokens = 4 // one classification word
 
-	tp, release, _, err := a.textPool.Acquire(binPath, *model, params, "")
+	tp, release, _, err := a.textPool.Acquire(context.Background(), binPath, *model, params, "")
 	if err != nil {
 		return fallback
 	}
@@ -393,12 +393,13 @@ func displayModelName(m registry.Model) string {
 func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Session, needVision bool, complexity router.Complexity) (string, bool) {
 	models := a.reg.ByKind(registry.KindText)
 	tried := map[string]bool{}
+	fallbackNoticeSent := false
 
 	for attempt := 0; attempt < 3; attempt++ {
 		if ctx.Err() != nil {
 			return "", false // stopped by the user — finishInterrupted handles reporting this
 		}
-		model, err := router.SelectTextModel(models, a.profile, complexity, needVision, tried)
+		model, err := router.SelectTextModel(models, a.profile, complexity, needVision, tried, sess.LastTextID)
 		if err != nil {
 			if len(tried) > 0 {
 				// A candidate WAS found and attempted (visible in tried) but
@@ -430,6 +431,25 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 
 		gen.send(map[string]any{"type": "model", "role": "text", "name": displayModelName(*model)})
 
+		// A pick that fails to load/generate gets excluded (tried) and this
+		// loop falls back to whatever else fits — sensible self-healing, but
+		// silent about it otherwise looks exactly like "my selection was
+		// ignored" (this is genuinely what a user reported after a selected
+		// model kept timing out on slow storage — see healthTimeoutFor's doc
+		// comment for that specific case). One notice per turn, only when
+		// the model actually used differs from the explicit pick.
+		if sess.LastTextID != "" && model.ID != sess.LastTextID && !fallbackNoticeSent {
+			fallbackNoticeSent = true
+			requestedName := sess.LastTextID
+			for _, m := range models {
+				if m.ID == sess.LastTextID {
+					requestedName = displayModelName(m)
+					break
+				}
+			}
+			gen.send(map[string]any{"type": "model_fallback", "requested": requestedName, "used": displayModelName(*model)})
+		}
+
 		params := router.InferTextParams(*model, a.profile, len(sess.Messages[len(sess.Messages)-1].Content), complexity)
 		text, err := a.generateText(ctx, gen, binPath, *model, params, sess, needVision)
 		if err == nil {
@@ -449,7 +469,7 @@ func (a *App) runTextTurn(ctx context.Context, gen *Generation, sess *session.Se
 }
 
 func (a *App) generateText(ctx context.Context, gen *Generation, binPath string, model registry.Model, params router.TextParams, sess *session.Session, needVision bool) (string, error) {
-	opID, end := a.activity.Begin(ActivityGeneratingText)
+	opID, end := a.activity.Begin(ActivityGeneratingText, displayModelName(model))
 	defer end()
 
 	mmproj := ""
@@ -485,7 +505,7 @@ func (a *App) generateText(ctx context.Context, gen *Generation, binPath string,
 	// so extra headroom here costs very little in the failure case.
 	const maxTextGenerationAttempts = 8
 	for attempt := 0; attempt < maxTextGenerationAttempts; attempt++ {
-		tp, release, started, err := a.textPool.Acquire(binPath, model, params, mmproj)
+		tp, release, started, err := a.textPool.Acquire(ctx, binPath, model, params, mmproj)
 		if err != nil {
 			lastErr = fmt.Errorf("starting/acquiring model instance: %w", err)
 			stepDown(err.Error())
@@ -639,13 +659,18 @@ func (a *App) ensureImageBinary(ctx context.Context) (string, engine.Status) {
 // persists the result. Returns event data (including "rel_path" for the
 // session message) and whether the turn was handled.
 func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.Session, rawPrompt string) (map[string]any, bool) {
-	opID, end := a.activity.Begin(ActivityGeneratingImage)
+	// detail is empty at Begin — which model this op is using isn't known
+	// until SelectImageModel picks one below, and may change across a
+	// fallback retry within this same op — so it's set with SetDetail
+	// instead, once (and each time) a model is actually selected.
+	opID, end := a.activity.Begin(ActivityGeneratingImage, "")
 	defer end()
 	enriched := a.enrichImagePrompt(ctx, rawPrompt)
 	gen.send(map[string]any{"type": "image_prompt", "prompt": enriched})
 
 	models := a.reg.ByKind(registry.KindImage)
 	tried := map[string]bool{}
+	fallbackNoticeSent := false
 
 	// One shared deadline for the whole response, not per model tried —
 	// otherwise a bad first pick could burn its own full 10 minutes before
@@ -656,7 +681,7 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 		if time.Until(deadline) < 30*time.Second || ctx.Err() != nil {
 			break
 		}
-		model, err := router.SelectImageModel(models, a.profile, tried)
+		model, err := router.SelectImageModel(models, a.profile, tried, sess.LastImageID)
 		if err != nil {
 			if len(tried) > 0 {
 				// A candidate WAS found and attempted (see runTextTurn's
@@ -681,6 +706,19 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 		}
 
 		gen.send(map[string]any{"type": "model", "role": "image", "name": displayModelName(*model)})
+		a.activity.SetDetail(opID, displayModelName(*model))
+
+		if sess.LastImageID != "" && model.ID != sess.LastImageID && !fallbackNoticeSent {
+			fallbackNoticeSent = true
+			requestedName := sess.LastImageID
+			for _, m := range models {
+				if m.ID == sess.LastImageID {
+					requestedName = displayModelName(m)
+					break
+				}
+			}
+			gen.send(map[string]any{"type": "model_fallback", "requested": requestedName, "used": displayModelName(*model)})
+		}
 
 		params := router.InferImageParams(*model, a.profile)
 		png, err := a.generateImage(ctx, opID, binPath, *model, enriched, params, deadline)
@@ -715,8 +753,27 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 // (maximizing quality) rather than a fixed guess — and the request context
 // is always capped so the whole call (across every retry) can never exceed
 // imageTotalBudget, regardless of how slow the hardware turns out to be.
+// fluxComponentPaths resolves a FLUX.2 checkpoint's paired VAE/text-encoder
+// filenames (see registry.Model.PairedVAE/PairedTextEncoder) to full paths
+// in models/image/, empty for every other family — the direct signal
+// engine.ImageRequest uses to decide between the plain -m path and FLUX.2's
+// three-file --diffusion-model/--vae/--llm invocation.
+func (a *App) fluxComponentPaths(model registry.Model) (vae, llm string) {
+	if model.ImageFamily != registry.ImageFamilyFlux2 {
+		return "", ""
+	}
+	if model.PairedVAE != "" {
+		vae = filepath.Join(a.dirs.ModelsImage, model.PairedVAE)
+	}
+	if model.PairedTextEncoder != "" {
+		llm = filepath.Join(a.dirs.ModelsImage, model.PairedTextEncoder)
+	}
+	return vae, llm
+}
+
 func (a *App) generateImage(ctx context.Context, opID string, binPath string, model registry.Model, prompt string, params router.ImageParams, deadline time.Time) ([]byte, error) {
 	threads := a.profile.CPUCores
+	vaePath, llmPath := a.fluxComponentPaths(model)
 
 	// Cold start: with no real measurement yet, StepsForBudget's built-in
 	// guess (assumes a modest modern CPU) can be wildly wrong on weak or
@@ -750,8 +807,8 @@ func (a *App) generateImage(ctx context.Context, opID string, binPath string, mo
 		}
 		genCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
 		result, err := engine.GenerateImage(genCtx, engine.ImageRequest{
-			BinPath: binPath, ModelPath: model.Path, Prompt: prompt,
-			Width: params.Width, Height: params.Height, Steps: params.Steps,
+			BinPath: binPath, ModelPath: model.Path, VAEPath: vaePath, LLMPath: llmPath, Prompt: prompt,
+			Width: params.Width, Height: params.Height, Steps: params.Steps, CFGScale: params.CFGScale,
 			Threads: threads, TmpDir: a.dirs.Downloads,
 		})
 		cancel()
@@ -795,10 +852,11 @@ func (a *App) calibrateImagePerf(ctx context.Context, binPath string, model regi
 		return // not enough budget left to even try a probe
 	}
 
+	vaePath, llmPath := a.fluxComponentPaths(model)
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	result, _ := engine.GenerateImage(probeCtx, engine.ImageRequest{
-		BinPath: binPath, ModelPath: model.Path, Prompt: "calibration probe",
+		BinPath: binPath, ModelPath: model.Path, VAEPath: vaePath, LLMPath: llmPath, Prompt: "calibration probe",
 		Width: width, Height: height, Steps: probeSteps,
 		Threads: threads, TmpDir: a.dirs.Downloads,
 	})
@@ -814,7 +872,7 @@ func (a *App) calibrateImagePerf(ctx context.Context, binPath string, model regi
 // model/engine is available yet, so image generation still works standalone.
 func (a *App) enrichImagePrompt(ctx context.Context, rawPrompt string) string {
 	models := a.reg.ByKind(registry.KindText)
-	model, err := router.SelectTextModel(models, a.profile, router.ComplexitySimple, false, nil)
+	model, err := router.SelectTextModel(models, a.profile, router.ComplexitySimple, false, nil, "")
 	if err != nil {
 		return rawPrompt
 	}
@@ -827,7 +885,7 @@ func (a *App) enrichImagePrompt(ctx context.Context, rawPrompt string) string {
 	if model.VisionCapable() {
 		mmproj = filepath.Join(a.dirs.ModelsText, model.PairedProjector)
 	}
-	tp, release, _, err := a.textPool.Acquire(binPath, *model, params, mmproj)
+	tp, release, _, err := a.textPool.Acquire(ctx, binPath, *model, params, mmproj)
 	if err != nil {
 		return rawPrompt
 	}
