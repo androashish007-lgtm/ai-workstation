@@ -91,7 +91,7 @@ func StartTextServer(ctx context.Context, binPath, modelPath string, ctxTokens, 
 
 	sizeBytes := fileSizeOrZero(modelPath)
 	progress := loadProgress{pid: cmd.Process.Pid, sizeBytes: sizeBytes, label: filepath.Base(modelPath)}
-	if err := waitHealthy(ctx, tp.baseURL+"/health", healthTimeoutFor(sizeBytes), exited, progress); err != nil {
+	if err := waitHealthy(ctx, tp.baseURL+"/health", LoadTimeoutFor(sizeBytes), exited, progress); err != nil {
 		if cmd.Process != nil {
 			cmd.Process.Kill()
 		}
@@ -122,13 +122,17 @@ const maxHealthTimeout = 10 * time.Minute
 // can't distinguish from an actually-stuck process.
 const assumedFloorMBPerSec = 20.0
 
-// healthTimeoutFor sizes the health-check timeout to the model file's size
-// so a large model on slow storage gets proportionally more time before
-// being judged stuck, while a small model (or any model on typical fast
-// storage) still fails within minHealthTimeout if something's really wrong.
-// sizeBytes 0 (file couldn't be stat'd) falls back to minHealthTimeout — the
-// actual load is about to fail anyway if that's the case.
-func healthTimeoutFor(sizeBytes int64) time.Duration {
+// LoadTimeoutFor sizes a load-phase timeout to the total bytes being
+// loaded, so a large model (or set of files, for a multi-file image model)
+// on slow storage gets proportionally more time before being judged stuck,
+// while a small one (or anything on typical fast storage) still fails
+// within minHealthTimeout if something's really wrong. sizeBytes 0 (file
+// couldn't be stat'd) falls back to minHealthTimeout — the actual load is
+// about to fail anyway if that's the case. Shared between the text engine's
+// health-check wait and the image engine's load-phase watchdog (see
+// image.go) — both are "how long until we give up on this model even
+// starting," the same question for either engine.
+func LoadTimeoutFor(sizeBytes int64) time.Duration {
 	sizeMB := float64(sizeBytes) / (1 << 20)
 	estimatedLoad := time.Duration(sizeMB / assumedFloorMBPerSec * float64(time.Second))
 	timeout := estimatedLoad + 30*time.Second // startup/health-check overhead on top of the raw read
@@ -185,7 +189,7 @@ func waitHealthy(ctx context.Context, url string, timeout time.Duration, exited 
 		}
 		if time.Since(lastProgress) >= progressInterval {
 			lastProgress = time.Now()
-			safeLogLoadProgress(progress)
+			safeLogLoadProgress(progress, deadline)
 		}
 		select {
 		case <-ctx.Done():
@@ -213,23 +217,34 @@ func waitHealthy(ctx context.Context, url string, timeout time.Duration, exited 
 // should ever get a chance to threaten the actual generation it's running
 // alongside (see processRSSBytes's Windows implementation for the incident
 // that made this the rule rather than a hypothetical).
-func safeLogLoadProgress(p loadProgress) {
+func safeLogLoadProgress(p loadProgress, deadline time.Time) {
 	defer func() { recover() }()
-	logLoadProgress(p)
+	logLoadProgress(p, deadline)
 }
 
-func logLoadProgress(p loadProgress) {
+func logLoadProgress(p loadProgress, deadline time.Time) {
+	// See image.go's deadlineNote for why this is only ever a log line, not
+	// something the app acts on — the timeout itself already scales with
+	// this model's file size (see healthTimeoutFor), this just makes how
+	// much of that budget is left visible while it's still running instead
+	// of only finding out when it either succeeds or times out.
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+	deadlineSuffix := fmt.Sprintf(" — %s left before this load is given up on", remaining.Round(time.Second))
+
 	rss, ok := processRSSBytes(p.pid)
 	if !ok || p.sizeBytes <= 0 {
-		log.Printf("still loading %s...", p.label)
+		log.Printf("still loading %s...%s", p.label, deadlineSuffix)
 		return
 	}
 	pct := float64(rss) / float64(p.sizeBytes) * 100
 	if pct > 100 {
 		pct = 100
 	}
-	log.Printf("loading %s: ~%.0f%% (%.1f GB / %.1f GB)", p.label, pct,
-		float64(rss)/(1<<30), float64(p.sizeBytes)/(1<<30))
+	log.Printf("loading %s: ~%.0f%% (%.1f GB / %.1f GB)%s", p.label, pct,
+		float64(rss)/(1<<30), float64(p.sizeBytes)/(1<<30), deadlineSuffix)
 }
 
 func lastLines(s string, n int) string {

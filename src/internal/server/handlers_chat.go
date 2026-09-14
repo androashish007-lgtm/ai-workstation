@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image/png"
 	"log"
 	"net/http"
 	"os"
@@ -654,6 +655,41 @@ func (a *App) ensureImageBinary(ctx context.Context) (string, engine.Status) {
 	return "", i.Status
 }
 
+// editImagePath returns the absolute path to the attached reference image
+// for this turn, if any — the last message is always the user's own (see
+// runChatTurn: it's appended before either turn runs, and neither turn
+// appends anything else before this one is called). Editing an attached
+// image only makes sense against the message that just triggered this
+// turn, not some earlier attachment already discussed and left behind.
+func (a *App) editImagePath(sess *session.Session) string {
+	if len(sess.Messages) == 0 {
+		return ""
+	}
+	last := sess.Messages[len(sess.Messages)-1]
+	if last.Role != session.RoleUser || len(last.ImagePaths) == 0 {
+		return ""
+	}
+	return filepath.Join(a.dirs.Images, filepath.FromSlash(last.ImagePaths[0]))
+}
+
+// imageDimensions reads just enough of a PNG to report its size, without
+// decoding pixels — used so an edit request renders at the attached
+// image's own resolution instead of whatever generic size the target
+// model's family would otherwise default to, which would force sd-cli to
+// resize/crop the reference and likely misalign the result.
+func imageDimensions(path string) (width, height int, ok bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, 0, false
+	}
+	defer f.Close()
+	cfg, err := png.DecodeConfig(f)
+	if err != nil {
+		return 0, 0, false
+	}
+	return cfg.Width, cfg.Height, true
+}
+
 // runImageTurn enriches the prompt via the resident text model, generates
 // an image with automatic model selection and step-down/fallback retry, and
 // persists the result. Returns event data (including "rel_path" for the
@@ -665,7 +701,19 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 	// instead, once (and each time) a model is actually selected.
 	opID, end := a.activity.Begin(ActivityGeneratingImage, "")
 	defer end()
-	enriched := a.enrichImagePrompt(ctx, rawPrompt)
+
+	initImagePath := a.editImagePath(sess)
+	// Editing an attached image needs a short, direct instruction ("remove
+	// the cap") — enrichImagePrompt's job is turning a short request into
+	// an elaborate from-scratch scene description, which is the wrong
+	// shape here and would bury the actual edit instruction under
+	// invented scene detail the model has no business changing.
+	var enriched string
+	if initImagePath != "" {
+		enriched = rawPrompt
+	} else {
+		enriched = a.enrichImagePrompt(ctx, rawPrompt)
+	}
 	gen.send(map[string]any{"type": "image_prompt", "prompt": enriched})
 
 	models := a.reg.ByKind(registry.KindImage)
@@ -681,7 +729,7 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 		if time.Until(deadline) < 30*time.Second || ctx.Err() != nil {
 			break
 		}
-		model, err := router.SelectImageModel(models, a.profile, tried, sess.LastImageID)
+		model, err := router.SelectImageModel(models, a.profile, tried, sess.LastImageID, initImagePath != "")
 		if err != nil {
 			if len(tried) > 0 {
 				// A candidate WAS found and attempted (see runTextTurn's
@@ -721,7 +769,24 @@ func (a *App) runImageTurn(ctx context.Context, gen *Generation, sess *session.S
 		}
 
 		params := router.InferImageParams(*model, a.profile)
-		png, err := a.generateImage(ctx, opID, binPath, *model, enriched, params, deadline)
+		if initImagePath != "" {
+			// Match the attached image's own resolution rather than the
+			// model family's generic default — sd-cli would otherwise
+			// resize/crop the reference to fit, which risks misaligning
+			// the edit with what the user is actually looking at.
+			if w, h, ok := imageDimensions(initImagePath); ok {
+				params.Width, params.Height = w, h
+			}
+			// Strength/ImgCFGScale are specific to -i/--init-img's SDEdit
+			// mechanism — meaningless (and left unset) for a model using
+			// -r/--ref-image instead (see router.UsesReferenceImageEditing
+			// and generateImage's request-building for which flag actually
+			// gets used).
+			if !router.UsesReferenceImageEditing(*model) {
+				params.Strength, params.ImgCFGScale = router.InferEditParams(*model)
+			}
+		}
+		png, err := a.generateImage(ctx, opID, binPath, *model, enriched, initImagePath, params, deadline)
 		if err == nil {
 			relPath, url, saveErr := a.saveGeneratedImage(sess.ID, png)
 			if saveErr != nil {
@@ -771,9 +836,25 @@ func (a *App) fluxComponentPaths(model registry.Model) (vae, llm string) {
 	return vae, llm
 }
 
-func (a *App) generateImage(ctx context.Context, opID string, binPath string, model registry.Model, prompt string, params router.ImageParams, deadline time.Time) ([]byte, error) {
+func (a *App) generateImage(ctx context.Context, opID string, binPath string, model registry.Model, prompt, initImagePath string, params router.ImageParams, deadline time.Time) ([]byte, error) {
 	threads := a.profile.CPUCores
 	vaePath, llmPath := a.fluxComponentPaths(model)
+	// -i/--init-img and -r/--ref-image are two different edit mechanisms
+	// (see router.UsesReferenceImageEditing) — exactly one gets the
+	// attached image's path, matching which flag this model actually uses.
+	initPath, refPath := initImagePath, ""
+	if initImagePath != "" && router.UsesReferenceImageEditing(model) {
+		initPath, refPath = "", initImagePath
+	}
+
+	// Sized from the actual checkpoint file(s) on disk — a multi-GB FLUX.2
+	// checkpoint legitimately needs much longer to load than a small SD1.5
+	// one, and this is now its own clock, entirely separate from the
+	// generation-phase timeout below (see engine.ImageRequest.LoadTimeout's
+	// doc comment for why: a single blended timeout let load time silently
+	// eat into the same budget generation needed, and there was no way to
+	// tell from a failure which phase actually ran out).
+	loadTimeout := engine.LoadTimeoutFor(imageCheckpointBytes(model.Path, vaePath, llmPath))
 
 	// Cold start: with no real measurement yet, StepsForBudget's built-in
 	// guess (assumes a modest modern CPU) can be wildly wrong on weak or
@@ -781,8 +862,8 @@ func (a *App) generateImage(ctx context.Context, opID string, binPath string, mo
 	// at the guessed step count would overshoot its own timeout and burn
 	// most of the 10-minute budget before any retry gets a chance. A cheap,
 	// short, capped probe gets a real number on the board first.
-	if !a.imagePerf.HasData() {
-		a.calibrateImagePerf(ctx, binPath, model, params.Width, params.Height, threads, time.Until(deadline))
+	if !a.imagePerf.HasData(model.ID) {
+		a.calibrateImagePerf(ctx, binPath, model, initImagePath, params.Width, params.Height, threads, time.Until(deadline), loadTimeout)
 	}
 
 	var lastErr error
@@ -795,27 +876,44 @@ func (a *App) generateImage(ctx context.Context, opID string, binPath string, mo
 		if attempt > 0 || targetSeconds > remaining.Seconds()-5 {
 			targetSeconds = remaining.Seconds() - 5
 		}
-		params.Steps = a.imagePerf.StepsForBudget(params.Width, params.Height, targetSeconds, 8, imageMaxSteps)
+		params.Steps = a.imagePerf.StepsForBudget(model.ID, params.Width, params.Height, targetSeconds, 8, imageMaxSteps)
 
-		// Cap this attempt's own timeout to its target budget (with slack
-		// for the estimate being off), not the full remaining time — a bad
-		// per-step estimate on an early attempt must not consume the whole
-		// 10-minute ceiling and leave nothing for a step-down retry.
-		attemptTimeout := time.Duration(targetSeconds*1.15+15) * time.Second
-		if attemptTimeout > remaining {
-			attemptTimeout = remaining
+		// GenTimeout budgets this attempt's own generation phase (sampling +
+		// decode/conditioning overhead) only — load has already been given
+		// its own separate clock above, so this no longer needs the extra
+		// padding a blended timeout used to require for load time it
+		// couldn't otherwise account for. The overhead term is this model's
+		// measured pure decode/conditioning cost (imageperf.RecordOverhead
+		// now subtracts load time out before recording it), scaled up for
+		// the same estimate-noise reason as safetyMargin.
+		overhead := a.imagePerf.Overhead(model.ID)
+		genTimeout := time.Duration(targetSeconds*1.15+overhead*1.3+15) * time.Second
+		if remaining-loadTimeout < genTimeout {
+			genTimeout = remaining - loadTimeout
 		}
-		genCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
-		result, err := engine.GenerateImage(genCtx, engine.ImageRequest{
+		if genTimeout < 15*time.Second {
+			genTimeout = 15 * time.Second
+		}
+		attemptStart := time.Now()
+		result, err := engine.GenerateImage(ctx, engine.ImageRequest{
 			BinPath: binPath, ModelPath: model.Path, VAEPath: vaePath, LLMPath: llmPath, Prompt: prompt,
 			Width: params.Width, Height: params.Height, Steps: params.Steps, CFGScale: params.CFGScale,
+			InitImagePath: initPath, ReferenceImagePath: refPath, Strength: params.Strength, ImgCFGScale: params.ImgCFGScale,
 			Threads: threads, TmpDir: a.dirs.Downloads,
+			LoadTimeout: loadTimeout, GenTimeout: genTimeout,
 		})
-		cancel()
+		attemptElapsed := time.Since(attemptStart)
 		a.activity.Beat(opID)
 
 		if secPerStep, ok := imageperf.ParseSecPerStep(result.RawOutput); ok {
-			a.imagePerf.Record(params.Width, params.Height, secPerStep)
+			a.imagePerf.Record(model.ID, params.Width, params.Height, secPerStep)
+		}
+		// Recorded on failure just as much as success — a killed-right-
+		// before-the-finish-line attempt (steps reached but the process
+		// died before completing) is exactly the measurement that needs to
+		// correct this model's overhead estimate upward.
+		if stepsReached, _, ok := imageperf.ParseStepsReached(result.RawOutput); ok {
+			a.imagePerf.RecordOverhead(model.ID, params.Width, params.Height, attemptElapsed, result.LoadDuration, stepsReached)
 		}
 		if err == nil {
 			return result.PNG, nil
@@ -827,6 +925,26 @@ func (a *App) generateImage(ctx context.Context, opID string, binPath string, mo
 		return nil, fmt.Errorf("could not finish within the %s budget on this hardware: %w", imageTotalBudget, lastErr)
 	}
 	return nil, fmt.Errorf("could not finish within the %s budget on this hardware", imageTotalBudget)
+}
+
+// imageCheckpointBytes sums the on-disk size of every file a generation
+// attempt will need to load — a plain single -m checkpoint, or FLUX.2's
+// three separate diffusion-model/VAE/text-encoder files — so engine.LoadTimeoutFor
+// can size the load-phase timeout off the real amount of data being read,
+// not just the main checkpoint alone. A path that fails to stat contributes
+// nothing rather than aborting the whole calculation; LoadTimeoutFor's own
+// floor still applies.
+func imageCheckpointBytes(paths ...string) int64 {
+	var total int64
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		if fi, err := os.Stat(p); err == nil {
+			total += fi.Size()
+		}
+	}
+	return total
 }
 
 // calibrateImagePerf runs a short, cheap probe (2 steps, at the actual
@@ -842,29 +960,48 @@ func (a *App) generateImage(ctx context.Context, opID string, binPath string, mo
 // (an extremely slow machine), a deliberately conservative synthetic
 // estimate is recorded so the real attempt still picks a small, safe step
 // count instead of repeating the same overshoot.
-func (a *App) calibrateImagePerf(ctx context.Context, binPath string, model registry.Model, width, height, threads int, budgetLeft time.Duration) {
+func (a *App) calibrateImagePerf(ctx context.Context, binPath string, model registry.Model, initImagePath string, width, height, threads int, budgetLeft, loadTimeout time.Duration) {
 	const probeSteps = 2
-	probeTimeout := 110 * time.Second
-	if probeTimeout > budgetLeft {
-		probeTimeout = budgetLeft
+	probeGenTimeout := 110 * time.Second
+	if probeGenTimeout > budgetLeft-loadTimeout {
+		probeGenTimeout = budgetLeft - loadTimeout
 	}
-	if probeTimeout < 15*time.Second {
+	if probeGenTimeout < 15*time.Second {
 		return // not enough budget left to even try a probe
 	}
 
 	vaePath, llmPath := a.fluxComponentPaths(model)
-	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
-	defer cancel()
-	result, _ := engine.GenerateImage(probeCtx, engine.ImageRequest{
+	initPath, refPath := initImagePath, ""
+	var strength, imgCFGScale float64
+	if initImagePath != "" {
+		if router.UsesReferenceImageEditing(model) {
+			initPath, refPath = "", initImagePath
+		} else {
+			strength, imgCFGScale = router.InferEditParams(model)
+		}
+	}
+	probeStart := time.Now()
+	result, _ := engine.GenerateImage(ctx, engine.ImageRequest{
 		BinPath: binPath, ModelPath: model.Path, VAEPath: vaePath, LLMPath: llmPath, Prompt: "calibration probe",
 		Width: width, Height: height, Steps: probeSteps,
+		InitImagePath: initPath, ReferenceImagePath: refPath, Strength: strength, ImgCFGScale: imgCFGScale,
 		Threads: threads, TmpDir: a.dirs.Downloads,
+		LoadTimeout: loadTimeout, GenTimeout: probeGenTimeout,
 	})
+	probeElapsed := time.Since(probeStart)
+	// The probe runs the same full load-sample-decode cycle as a real
+	// generation (just at probeSteps instead of a full step count), so it's
+	// a real, if noisy, overhead measurement too — seeding this early gets
+	// a much better first real-attempt timeout than defaultOverheadSeconds
+	// alone would for a model nobody's generated with on this machine yet.
+	if stepsReached, _, ok := imageperf.ParseStepsReached(result.RawOutput); ok {
+		a.imagePerf.RecordOverhead(model.ID, width, height, probeElapsed, result.LoadDuration, stepsReached)
+	}
 	if secPerStep, ok := imageperf.ParseSecPerStep(result.RawOutput); ok {
-		a.imagePerf.Record(width, height, secPerStep)
+		a.imagePerf.Record(model.ID, width, height, secPerStep)
 		return
 	}
-	a.imagePerf.Record(512, 512, 60.0) // conservative fallback: assume this machine is slow
+	a.imagePerf.Record(model.ID, 512, 512, 60.0) // conservative fallback: assume this machine is slow
 }
 
 // enrichImagePrompt asks the resident text model to turn a short request

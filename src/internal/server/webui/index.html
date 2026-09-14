@@ -103,7 +103,9 @@
 
       <div id="settingsLogsSection" class="settings-section" hidden>
         <p class="hw-line">Live tail of this app's own log — the same stream that would otherwise only be
-          visible in the console window, plus <code>data/logs/app.log</code> on disk.</p>
+          visible in the console window, plus <code>data/logs/live.log</code> on disk for this run and
+          <code>data/logs/history.log</code> accumulating every past run, for troubleshooting something
+          noticed after the fact.</p>
         <pre id="logsView" class="logs-view"></pre>
       </div>
 

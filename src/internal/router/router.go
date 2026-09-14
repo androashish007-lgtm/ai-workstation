@@ -25,15 +25,29 @@ const (
 var imageVerbs = regexp.MustCompile(`(?i)\b(draw|paint|sketch|render|generate|create|make|design)\b.{0,40}\b(image|picture|photo|art|illustration|drawing|painting|logo|icon|wallpaper|poster|scene)\b`)
 var imageNouns = regexp.MustCompile(`(?i)\b(a picture of|an image of|a photo of|a drawing of|a painting of)\b`)
 
+// editVerbs matches phrasing that asks to modify an attached image rather
+// than either generate a new one from scratch or describe it — "recreate
+// the image, remove the cap" is the case that motivated this: it contains
+// neither an imageVerbs match ("recreate" isn't one of the generation
+// verbs) nor an analysis phrase, so without this it fell through to plain
+// IntentText and got treated as "describe this image" instead of "edit
+// this image." Only checked when an image is actually attached (see
+// ClassifyIntent) — these verbs are common enough in plain text that
+// without that guard they'd misfire constantly.
+var editVerbs = regexp.MustCompile(`(?i)\b(edit|modify|recreate|retouch|touch up|alter|adjust|redo|transform|remove|erase|delete|replace|swap|recolor|colorize|change)\b`)
+
 // ClassifyIntent is a cheap heuristic first pass (regex, not a model call) —
 // good enough for the common phrasings; routing every message through the
 // LLM itself for intent classification is a Phase 2 refinement once this
 // baseline is proven in daily use.
 func ClassifyIntent(text string, hasImageAttachment bool) Intent {
 	wantsImage := imageVerbs.MatchString(text) || imageNouns.MatchString(text)
+	wantsEdit := hasImageAttachment && editVerbs.MatchString(text)
 	mentionsAnalysis := hasImageAttachment && (strings.Contains(strings.ToLower(text), "describe") ||
 		strings.Contains(strings.ToLower(text), "what is") || strings.Contains(strings.ToLower(text), "explain"))
 	switch {
+	case wantsEdit:
+		return IntentImage
 	case wantsImage && mentionsAnalysis:
 		return IntentMixed
 	case wantsImage:
@@ -161,17 +175,18 @@ func LooksLikeEditingModel(filename string) bool {
 }
 
 // SelectImageModel picks the largest installed plain text-to-image model
-// that fits the hardware budget (conditioned editing checkpoints like
-// pix2pix/inpainting are deprioritized to a last resort — see
-// LooksLikeEditingModel), since Phase 1 doesn't yet infer style/quality
-// tiers beyond "best the hardware can run."
+// that fits the hardware budget. Conditioned editing checkpoints like
+// pix2pix/inpainting (see LooksLikeEditingModel) are deprioritized to a
+// last resort for a plain generate-from-scratch request — but preferred
+// first when preferEditing is true (the request is actually editing an
+// attached image), since those are exactly the models built for that job.
 //
 // preferredID is the same user-override mechanism as SelectTextModel's: if
 // it names an installed, not-yet-excluded image model, that model is used
 // outright (bypassing both the budget check and the editing-model
-// deprioritization — an explicit pick is trusted as-is), otherwise this
-// falls through to the automatic pick.
-func SelectImageModel(models []registry.Model, profile hw.Profile, exclude map[string]bool, preferredID string) (*registry.Model, error) {
+// preference/deprioritization — an explicit pick is trusted as-is),
+// otherwise this falls through to the automatic pick.
+func SelectImageModel(models []registry.Model, profile hw.Profile, exclude map[string]bool, preferredID string, preferEditing bool) (*registry.Model, error) {
 	var candidates, editingCandidates []registry.Model
 	for _, m := range models {
 		if m.Kind != registry.KindImage || (exclude != nil && exclude[m.ID]) {
@@ -195,7 +210,9 @@ func SelectImageModel(models []registry.Model, profile hw.Profile, exclude map[s
 			candidates = append(candidates, m)
 		}
 	}
-	if len(candidates) == 0 {
+	if preferEditing && len(editingCandidates) > 0 {
+		candidates = editingCandidates
+	} else if len(candidates) == 0 {
 		candidates = editingCandidates
 	}
 	if len(candidates) == 0 {
@@ -355,6 +372,62 @@ type ImageParams struct {
 	// CFG-driven SD/SDXL models) would otherwise over-guide and degrade
 	// output badly on a Flux checkpoint.
 	CFGScale float64
+	// Strength/ImgCFGScale are only set when editing an attached image
+	// (see InferEditParams) — 0 means "not an edit, omit both flags."
+	Strength    float64
+	ImgCFGScale float64
+}
+
+// InferEditParams picks --strength/--img-cfg-scale for editing an attached
+// image, split by whether the selected model was actually built for
+// instruction-based editing (see LooksLikeEditingModel) or is a generic
+// SD/SDXL checkpoint being asked to do img2img anyway.
+//
+// --strength is noising strength, NOT "how strongly to apply the image
+// conditioning" — stable-diffusion.cpp's own --help is explicit that 1.0
+// means full destruction of the init image's information. 0.55 for an
+// editing model is an empirically-tuned middle ground, not a documented
+// default: real end-to-end testing against instruct-pix2pix walked through
+// 1.0 (output was a blank/garbled blob — the init image's information was
+// completely gone), 0.9 (same failure), 0.75 (recognizable but heavily
+// degraded), and 0.4 (the original scene came through clearly, but the
+// requested edit barely applied at all — too little noise for the
+// instruction to take hold). 0.55 sits between the "edit applies" and
+// "image survives" failure modes; it is a compromise, not a value that
+// reliably produces a clean result — the installed
+// instruct-pix2pix-00-22000-pruned-fp16 checkpoint (an old, small,
+// community-pruned conversion) is simply inconsistent at this kind of
+// precise photorealistic edit regardless of parameters. A generic
+// (non-editing) model gets a lower value still (0.4) since it has no
+// instruction-following conditioning to lean on at all — more of the
+// original needs to survive the noising for the prompt alone to land as a
+// targeted edit rather than a new, unrelated image that happens to reuse
+// the canvas size.
+//
+// --img-cfg-scale (image guidance scale, separate from the regular text
+// --cfg-scale) only applies to editing models — a generic model has no
+// separate image-conditioning path for it to scale, so it's left 0
+// (omitted) there. 1.5 for editing models matches the commonly-documented
+// InstructPix2Pix default pairing (~7.5 text / ~1.5 image guidance) —
+// noticeably lower than text guidance so the edit instruction can actually
+// take effect instead of being dominated by "stay close to the input."
+func InferEditParams(model registry.Model) (strength, imgCFGScale float64) {
+	if LooksLikeEditingModel(model.Filename) {
+		return 0.55, 1.5
+	}
+	return 0.4, 0
+}
+
+// UsesReferenceImageEditing reports whether editing an attached image with
+// this model should use sd-cli's -r/--ref-image (FLUX Kontext/FLUX.2's own
+// instruction-following reference-conditioning) instead of -i/--init-img's
+// SDEdit-style renoising (see InferEditParams). Confirmed against a real
+// test: pointing a FLUX.2 edit request at -i produced an image that
+// resembled the attached photo but completely ignored the text
+// instruction — -i has no "follow this instruction" concept, it just
+// partially renoises and redraws; -r is FLUX's actual edit path.
+func UsesReferenceImageEditing(model registry.Model) bool {
+	return model.ImageFamily == registry.ImageFamilyFlux2
 }
 
 func InferImageParams(model registry.Model, profile hw.Profile) ImageParams {

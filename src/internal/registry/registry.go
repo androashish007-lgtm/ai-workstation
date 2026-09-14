@@ -325,7 +325,7 @@ func (r *Registry) registerIfChanged(absPath string, isText bool) {
 		if !isText {
 			refreshed := existing
 			refreshed.ImageFamily = guessImageFamily(refreshed.Filename, refreshed.Architecture)
-			refreshed.ImageRole = guessImageRole(refreshed.Filename)
+			refreshed.ImageRole = guessImageRole(refreshed.Filename, refreshed.Architecture)
 			if refreshed.ImageFamily != existing.ImageFamily || refreshed.ImageRole != existing.ImageRole {
 				r.mu.Lock()
 				r.models[absPath] = refreshed
@@ -402,13 +402,12 @@ func fingerprintAndClassify(absPath string, isText bool) (Model, error) {
 	}
 	if isText {
 		m.Kind = KindText
-	} else {
-		m.ImageRole = guessImageRole(m.Filename)
 	}
 	meta, err := ParseGGUFMeta(absPath)
 	if err != nil {
 		m.ParseError = err.Error()
 		if !isText {
+			m.ImageRole = guessImageRole(m.Filename, "")
 			m.ImageFamily = guessImageFamily(m.Filename, "")
 		}
 		return m, nil // still register it; capability detection just degrades
@@ -419,6 +418,11 @@ func fingerprintAndClassify(absPath string, isText bool) (Model, error) {
 	m.ContextLength = meta.ContextLength
 	m.IsVisionProjector = meta.IsVisionClip
 	if !isText {
+		// Role detection needs the parsed architecture, not just the
+		// filename — see guessImageRole's doc comment for why (a
+		// text-encoder GGUF's filename often carries no hint at all that
+		// it's an LLM rather than a diffusion checkpoint).
+		m.ImageRole = guessImageRole(m.Filename, meta.Architecture)
 		m.ImageFamily = guessImageFamily(m.Filename, meta.Architecture)
 	}
 	return m, nil
@@ -445,17 +449,39 @@ func guessImageFamily(filename, architecture string) ImageFamily {
 	return ImageFamilyUnknown
 }
 
-// guessImageRole flags a FLUX.2 VAE or text-encoder file by filename —
-// there's no metadata to parse for a role like this (they're ordinary
-// safetensors/GGUF weight files), but every source that publishes them
-// (black-forest-labs, unsloth, city96, leejet's own GGUF repos) names them
-// this way, matching stable-diffusion.cpp's own docs (docs/flux2.md).
-func guessImageRole(filename string) ImageRole {
+// textEncoderArchitectures: GGUF general.architecture values that mean
+// "this is a causal-LM/text-encoder, not a diffusion checkpoint" — checked
+// as substrings so a versioned name (qwen3, qwen2, llama3, ...) still
+// matches. This is the reliable signal guessImageRole leans on first: a
+// community-published text-encoder file (e.g. an abliterated/uncensored
+// one) is very often named after the *target* diffusion model it pairs
+// with rather than the underlying LLM — "flux2-klein-4b-uncensored-
+// q4_k_m.gguf" carries no filename hint at all that it's a Qwen3 LLM, but
+// its own GGUF metadata says general.architecture=qwen3 unambiguously.
+// Confirmed against a real downloaded file, not assumed.
+var textEncoderArchitectures = []string{"qwen", "llama", "mistral", "gemma", "phi", "t5", "mt5"}
+
+// guessImageRole flags a FLUX.2 VAE or text-encoder file, checking the
+// parsed GGUF architecture first (see textEncoderArchitectures) and
+// falling back to filename hints for everything else (a VAE is an
+// ordinary safetensors/GGUF tensor file with no architecture metadata to
+// key off, so filename is all there is) — every source that publishes
+// these (black-forest-labs, unsloth, city96, leejet's own GGUF repos)
+// names VAE files predictably, matching stable-diffusion.cpp's own docs
+// (docs/flux2.md): "ae.safetensors" alone, or with a vae/ae prefix.
+func guessImageRole(filename, architecture string) ImageRole {
+	arch := strings.ToLower(architecture)
+	for _, hint := range textEncoderArchitectures {
+		if strings.Contains(arch, hint) {
+			return ImageRoleTextEncoder
+		}
+	}
 	f := strings.ToLower(filename)
+	base := strings.TrimSuffix(f, filepath.Ext(f))
 	switch {
-	case strings.Contains(f, "vae") || strings.Contains(f, "_ae.") || strings.Contains(f, "-ae."):
+	case strings.Contains(f, "vae") || base == "ae" || strings.HasSuffix(base, "_ae") || strings.HasSuffix(base, "-ae"):
 		return ImageRoleVAE
-	case strings.Contains(f, "qwen") || strings.Contains(f, "mistral-small"):
+	case strings.Contains(f, "qwen") || strings.Contains(f, "mistral-small") || strings.Contains(f, "text-encoder") || strings.Contains(f, "text_encoder"):
 		return ImageRoleTextEncoder
 	}
 	return ImageRoleCheckpoint

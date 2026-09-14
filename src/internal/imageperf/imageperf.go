@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"time"
 )
 
 // conservative default before any real measurement exists: assumes a modest
@@ -20,19 +21,40 @@ import (
 // after the very first generation.
 const defaultSecPerStepAt512 = 8.0
 
+// defaultOverheadSeconds: conservative starting guess for the fixed cost of
+// one generation beyond sampling and beyond model load — VAE decode, text
+// conditioning. Model load now has its own separately-timed/enforced
+// LoadTimeout (see engine.ImageRequest), so this no longer needs to budget
+// for it. Self-corrects per model after the first real measurement, same as
+// SecPerStepAt512 — this default only matters for a model that's never been
+// generated with before.
+const defaultOverheadSeconds = 45.0
+
 type estimate struct {
 	SecPerStepAt512 float64 `json:"sec_per_step_at_512"`
 	Samples         int     `json:"samples"`
+	OverheadSeconds float64 `json:"overhead_seconds,omitempty"`
+	OverheadSamples int     `json:"overhead_samples,omitempty"`
 }
 
+// Store tracks a separate estimate per model, keyed by the registry model
+// ID passed into Record/SecPerStep/StepsForBudget/HasData — NOT one single
+// global number. Different image models have wildly different per-step
+// compute costs even at the same resolution (a small SD1.5 UNet vs. a much
+// larger FLUX-class transformer aren't remotely comparable); a single
+// blended estimate gets corrupted the moment a dramatically slower model is
+// tried even once. Confirmed the hard way: one FLUX.2-klein test run
+// (~9x slower per step than this machine's SD1.5 checkpoints) nearly
+// doubled what had been a well-calibrated global estimate, which would have
+// silently under-stepped every fast checkpoint used afterward.
 type Store struct {
 	mu   sync.Mutex
 	path string
-	est  estimate
+	byID map[string]*estimate
 }
 
 func New(dataDir string) *Store {
-	s := &Store{path: filepath.Join(dataDir, "image-perf.json"), est: estimate{SecPerStepAt512: defaultSecPerStepAt512}}
+	s := &Store{path: filepath.Join(dataDir, "image-perf.json"), byID: map[string]*estimate{}}
 	s.load()
 	return s
 }
@@ -42,14 +64,19 @@ func (s *Store) load() {
 	if err != nil {
 		return
 	}
-	var e estimate
-	if err := json.Unmarshal(b, &e); err == nil && e.SecPerStepAt512 > 0 {
-		s.est = e
+	var m map[string]*estimate
+	// A file from before per-model tracking was a single flat {sec_per_step_at_512,
+	// samples} object, not a map — it fails this Unmarshal (wrong shape) and
+	// is simply discarded rather than migrated: this is a self-healing perf
+	// cache the app already treats as freely re-calibratable, not data worth
+	// writing migration code for.
+	if err := json.Unmarshal(b, &m); err == nil && m != nil {
+		s.byID = m
 	}
 }
 
 func (s *Store) save() {
-	b, err := json.MarshalIndent(s.est, "", "  ")
+	b, err := json.MarshalIndent(s.byID, "", "  ")
 	if err != nil {
 		return
 	}
@@ -59,14 +86,14 @@ func (s *Store) save() {
 	}
 }
 
-// Record folds in one real measurement: secPerStep observed while
-// generating at width x height. Normalized to a 512x512-equivalent so
-// future estimates at any resolution can scale from one number. Uses an
-// exponential moving average so the estimate adapts to changing conditions
-// (thermal throttling, a different model's compute cost) without one
-// outlier sample swinging it wildly.
-func (s *Store) Record(width, height int, secPerStep float64) {
-	if secPerStep <= 0 || width <= 0 || height <= 0 {
+// Record folds in one real measurement for modelID: secPerStep observed
+// while generating at width x height. Normalized to a 512x512-equivalent
+// so future estimates at any resolution for this same model can scale from
+// one number. Uses an exponential moving average so the estimate adapts to
+// changing conditions (thermal throttling) without one outlier sample
+// swinging it wildly.
+func (s *Store) Record(modelID string, width, height int, secPerStep float64) {
+	if secPerStep <= 0 || width <= 0 || height <= 0 || modelID == "" {
 		return
 	}
 	pixelRatio := float64(width*height) / (512.0 * 512.0)
@@ -74,33 +101,102 @@ func (s *Store) Record(width, height int, secPerStep float64) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.est.Samples == 0 {
-		s.est.SecPerStepAt512 = normalized
+	e, ok := s.byID[modelID]
+	if !ok {
+		e = &estimate{}
+		s.byID[modelID] = e
+	}
+	if e.Samples == 0 {
+		e.SecPerStepAt512 = normalized
 	} else {
 		const alpha = 0.4
-		s.est.SecPerStepAt512 = s.est.SecPerStepAt512*(1-alpha) + normalized*alpha
+		e.SecPerStepAt512 = e.SecPerStepAt512*(1-alpha) + normalized*alpha
 	}
-	s.est.Samples++
+	e.Samples++
 	s.save()
 }
 
-// HasData reports whether any real measurement has ever been recorded —
-// false means every estimate so far is still the conservative built-in
-// guess, which callers can use to decide whether a cheap calibration probe
-// is worth running before committing to a full-length attempt.
-func (s *Store) HasData() bool {
+// RecordOverhead folds in one real measurement of the non-sampling,
+// non-load cost for modelID: given the attempt's total wall-clock time, how
+// long the separately-timed load phase took (loadDuration — model load is
+// now bounded by its own LoadTimeout and tracked via ImageResult.LoadDuration,
+// so it's subtracted here rather than blended in), and how many sampling
+// steps it actually completed (reached, from ParseStepsReached — recorded
+// on a timed-out/failed attempt just as much as a successful one, since a
+// near-miss that got killed one step from done is exactly the case this
+// exists to fix), the sampling time implied by the already-tracked
+// per-step estimate is subtracted off too; whatever's left is pure
+// decode/conditioning overhead. Same exponential-moving-average approach as
+// Record, independent sample count since the two measurements aren't
+// always available from the same run.
+func (s *Store) RecordOverhead(modelID string, width, height int, totalElapsed, loadDuration time.Duration, stepsReached int) {
+	if modelID == "" || stepsReached <= 0 || totalElapsed <= 0 || width <= 0 || height <= 0 {
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.est.Samples > 0
+	e, ok := s.byID[modelID]
+	if !ok {
+		e = &estimate{}
+		s.byID[modelID] = e
+	}
+	secPerStep := e.SecPerStepAt512
+	if e.Samples == 0 {
+		secPerStep = defaultSecPerStepAt512
+	}
+	pixelRatio := float64(width*height) / (512.0 * 512.0)
+	stepTime := time.Duration(float64(stepsReached) * secPerStep * pixelRatio * float64(time.Second))
+	overhead := (totalElapsed - loadDuration - stepTime).Seconds()
+	if overhead < 0 {
+		overhead = 0
+	}
+	if e.OverheadSamples == 0 {
+		e.OverheadSeconds = overhead
+	} else {
+		const alpha = 0.4
+		e.OverheadSeconds = e.OverheadSeconds*(1-alpha) + overhead*alpha
+	}
+	e.OverheadSamples++
+	s.save()
 }
 
-// SecPerStep returns the current estimated seconds-per-sampling-step at the
-// given resolution.
-func (s *Store) SecPerStep(width, height int) float64 {
+// Overhead returns the current estimated fixed non-sampling cost (model
+// load, VAE decode, text conditioning) for this model — the conservative
+// default if it has no real measurement yet.
+func (s *Store) Overhead(modelID string) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.byID[modelID]
+	if !ok || e.OverheadSamples == 0 {
+		return defaultOverheadSeconds
+	}
+	return e.OverheadSeconds
+}
+
+// HasData reports whether any real measurement has ever been recorded for
+// this specific model — false means its estimate is still the conservative
+// built-in guess, which callers can use to decide whether a cheap
+// calibration probe is worth running before committing to a full-length
+// attempt.
+func (s *Store) HasData(modelID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.byID[modelID]
+	return ok && e.Samples > 0
+}
+
+// SecPerStep returns the current estimated seconds-per-sampling-step for
+// this model at the given resolution — the conservative default if this
+// model has no real measurement yet.
+func (s *Store) SecPerStep(modelID string, width, height int) float64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	pixelRatio := float64(width*height) / (512.0 * 512.0)
-	return s.est.SecPerStepAt512 * pixelRatio
+	e, ok := s.byID[modelID]
+	if !ok || e.Samples == 0 {
+		return defaultSecPerStepAt512 * pixelRatio
+	}
+	return e.SecPerStepAt512 * pixelRatio
 }
 
 // safetyMargin inflates the measured per-step estimate before it's used to
@@ -113,17 +209,17 @@ func (s *Store) SecPerStep(width, height int) float64 {
 const safetyMargin = 1.3
 
 // StepsForBudget returns how many sampling steps fit in budgetSeconds at
-// the given resolution, leaving room for the fixed overhead every run pays
-// (model load, VAE encode/decode, text conditioning) — clamped to a
-// [minSteps, maxSteps] range so it never degrades below a usable floor or
-// spends steps past the point of meaningful quality return.
-func (s *Store) StepsForBudget(width, height int, budgetSeconds float64, minSteps, maxSteps int) int {
-	const fixedOverheadSeconds = 20.0
-	perStep := s.SecPerStep(width, height) * safetyMargin
+// the given resolution, leaving room for this model's own measured (or, if
+// unmeasured, conservatively guessed) fixed overhead — model load, VAE
+// decode, text conditioning — clamped to a [minSteps, maxSteps] range so it
+// never degrades below a usable floor or spends steps past the point of
+// meaningful quality return.
+func (s *Store) StepsForBudget(modelID string, width, height int, budgetSeconds float64, minSteps, maxSteps int) int {
+	perStep := s.SecPerStep(modelID, width, height) * safetyMargin
 	if perStep <= 0 {
 		perStep = defaultSecPerStepAt512
 	}
-	steps := int((budgetSeconds - fixedOverheadSeconds) / perStep)
+	steps := int((budgetSeconds - s.Overhead(modelID)) / perStep)
 	if steps < minSteps {
 		steps = minSteps
 	}
@@ -151,4 +247,26 @@ func ParseSecPerStep(output string) (float64, bool) {
 		return 0, false
 	}
 	return v, true
+}
+
+var stepCountRe = regexp.MustCompile(`(\d+)/(\d+)\s*-\s*[\d.]+s/it`)
+
+// ParseStepsReached extracts the last "current/total" step counter sd-cli
+// logged, so RecordOverhead can tell how much of the sampling phase
+// actually completed — deliberately works on a killed/timed-out run's
+// output just as much as a successful one's, since a near-miss that got
+// killed one step short of done (confirmed the real failure mode this
+// exists to fix) is exactly the case whose overhead needs correcting.
+func ParseStepsReached(output string) (current, total int, ok bool) {
+	matches := stepCountRe.FindAllStringSubmatch(output, -1)
+	if len(matches) == 0 {
+		return 0, 0, false
+	}
+	last := matches[len(matches)-1]
+	cur, err1 := strconv.Atoi(last[1])
+	tot, err2 := strconv.Atoi(last[2])
+	if err1 != nil || err2 != nil || cur <= 0 {
+		return 0, 0, false
+	}
+	return cur, tot, true
 }

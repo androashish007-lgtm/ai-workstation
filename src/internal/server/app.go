@@ -5,6 +5,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -135,31 +136,91 @@ func NewApp(root string) (*App, error) {
 	}, nil
 }
 
+// maxHistoryLogBytes caps how large the accumulated history.log is allowed
+// to grow before old content is trimmed from the front — an unbounded
+// append-forever file would otherwise eventually become its own problem
+// (slow to open, disk usage) on a workstation that's restarted often. 25MB
+// is generous for plain-text log lines — many sessions' worth — while still
+// being trivially small to read back.
+const maxHistoryLogBytes = 25 * 1024 * 1024
+
 // setupLogging routes every log.Printf (and the standard logger's default
 // output generally) to three places at once: stderr (unchanged behavior —
-// still visible in the console window start.bat/start.sh open), a plain
-// text file on disk for after-the-fact debugging, and the in-memory ring
-// buffer the Settings > Logs tab tails live. Previously only stderr existed
-// — closing the console window lost everything, and there was no way to
-// see what happened without keeping that window open the whole time.
+// still visible in the console window start.bat/start.sh open), live.log on
+// disk for the current run, and the in-memory ring buffer the Settings >
+// Logs tab tails live. Previously only stderr existed — closing the console
+// window lost everything, and there was no way to see what happened without
+// keeping that window open the whole time.
+//
+// Before live.log is reset for the new run, whatever it holds from the
+// previous run is folded into history.log first — this is the "end of
+// session" moment the live file gets overwritten, and it's the only one
+// that's reliably reachable: a crash or a killed process means there's no
+// guaranteed graceful-shutdown hook to rely on instead, but there's always
+// a next startup. That makes history.log an append-only record spanning
+// every past run (capped by maxHistoryLogBytes), for tracking down an issue
+// from a session that's already over — unlike live.log, which only ever
+// shows the run currently happening.
 func setupLogging(dataDir string, buf *logbuf.Buffer) {
 	logDir := filepath.Join(dataDir, "logs")
 	if err := os.MkdirAll(logDir, 0o755); err != nil {
 		log.SetOutput(io.MultiWriter(os.Stderr, buf))
 		return
 	}
-	logPath := filepath.Join(logDir, "app.log")
-	// Keep exactly one prior run's log around (app.log.1) rather than
-	// growing unboundedly — this is a debugging aid, not an audit trail.
-	if _, err := os.Stat(logPath); err == nil {
-		os.Rename(logPath, logPath+".1")
-	}
-	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	livePath := filepath.Join(logDir, "live.log")
+	historyPath := filepath.Join(logDir, "history.log")
+	archivePreviousLog(livePath, historyPath)
+
+	f, err := os.OpenFile(livePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		log.SetOutput(io.MultiWriter(os.Stderr, buf))
 		return
 	}
 	log.SetOutput(io.MultiWriter(os.Stderr, f, buf))
+}
+
+// archivePreviousLog appends whatever livePath currently holds (the
+// just-ended previous run, if any) onto historyPath, then trims historyPath
+// back down to maxHistoryLogBytes if that pushed it over — trimming from
+// the front so the most recent history is always what's kept. Best-effort:
+// any failure here just means one run's worth of history isn't preserved,
+// which isn't worth failing startup over.
+func archivePreviousLog(livePath, historyPath string) {
+	prev, err := os.ReadFile(livePath)
+	if err != nil || len(prev) == 0 {
+		return
+	}
+	hf, err := os.OpenFile(historyPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	if _, err := hf.Write(prev); err != nil {
+		hf.Close()
+		return
+	}
+	hf.Close()
+
+	if fi, err := os.Stat(historyPath); err == nil && fi.Size() > maxHistoryLogBytes {
+		trimLogFile(historyPath, maxHistoryLogBytes)
+	}
+}
+
+// trimLogFile keeps only the trailing keepBytes of path, cutting at the
+// next newline after that point so the file still starts on a clean line
+// boundary rather than mid-entry.
+func trimLogFile(path string, keepBytes int64) {
+	b, err := os.ReadFile(path)
+	if err != nil || int64(len(b)) <= keepBytes {
+		return
+	}
+	cut := int64(len(b)) - keepBytes
+	if i := bytes.IndexByte(b[cut:], '\n'); i >= 0 {
+		cut += int64(i) + 1
+	}
+	tmp := path + ".tmp"
+	if os.WriteFile(tmp, b[cut:], 0o644) == nil {
+		os.Rename(tmp, path)
+	}
 }
 
 func (a *App) Registry() *registry.Registry { return a.reg }
